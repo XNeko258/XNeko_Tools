@@ -53,6 +53,7 @@ XNeko Tools provides a lightweight module system for Blender. Each tool lives in
 
 - [Development Guide](docs/DEVELOPMENT.md) — how to create new tool modules, metadata fields, preferences, lifecycle hooks, and version compatibility.
 - [Preset Guide](docs/PRESETS.md) — how to export, import, apply, and share presets, and how project-embedded preferences work.
+- [Group Folder Guide](docs/GROUPS.md) — how to name folders under `tools/`, which folder names are allowed, and how icons are chosen.
 
 ## Project Structure
 

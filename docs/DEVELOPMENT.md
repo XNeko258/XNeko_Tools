@@ -343,3 +343,4 @@ from ...common import math_helpers
 ## See Also
 
 - [Preset Guide](PRESETS.md) — how presets and project-embedded preferences work.
+- [Group Folder Guide](GROUPS.md) — how to name folders under `tools/`
