@@ -1,7 +1,14 @@
+import os
+import json
 import bpy
-from bpy.props import StringProperty, BoolProperty, CollectionProperty, IntProperty
+from bpy.props import (
+    StringProperty, BoolProperty, CollectionProperty, IntProperty,
+    EnumProperty,
+)
+from bpy_extras.io_utils import ImportHelper
 
 from . import core
+from .common import prefs_io, preset_store
 
 
 # ---------------- Link configuration ----------------
@@ -15,10 +22,114 @@ LINKS = (
 
 
 # ==================================================
-# Layout helpers for dynamic tab pagination
+# Module-level state for the Apply Preset dialog
+# --------------------------------------------------
+# The dialog operator stays alive while it is open. We keep a
+# reference so the "All / None" helper operator can reach its
+# `entries` collection without relying on context.active_operator,
+# which is unreliable inside invoke_props_dialog.
+# ==================================================
+_ACTIVE_APPLY_OP = None
+
+
+# ==================================================
+# Helpers
+# ==================================================
+def _sanitize(name):
+    return "".join(c if c.isalnum() else "_" for c in name)
+
+
+def _make_pref_prefix(tool_id):
+    """Build a compact, unique prefix for a tool's preference props.
+
+    Blender limits RNA property names to 63 characters. The full
+    dotted tool_id path can easily exceed that, so we hash it down
+    to a fixed-width token:
+
+        "t_" + 12 hex chars of MD5(tool_id) + "_"
+
+    That's 15 characters total, leaving 48 for the local name.
+    The mapping is stored per-tool in `_pref_names` so JSON export
+    and import are unaffected (they use local names only).
+    """
+    import hashlib
+    h = hashlib.md5(tool_id.encode("utf-8")).hexdigest()[:12]
+    return f"t_{h}_"
+
+
+def _short_id(full_id):
+    """'XNeko_Tools.tools.mesh_tools.clean_groups' -> 'mesh_tools.clean_groups'."""
+    return full_id.split(".tools.", 1)[-1] if ".tools." in full_id else full_id
+
+
+def _full_id_map():
+    """Return {short_id: full_id} for every registered tool."""
+    return {_short_id(fid): fid for fid in core._TOOL_REGISTRY}
+
+
+def _redraw_view3d(context=None):
+    screen = (context.screen if context else None) or bpy.context.screen
+    if screen is None:
+        return
+    for area in screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
+class _ToolPrefNamespace:
+    """Thin wrapper giving tools an ergonomic view of their prefs.
+
+    Usage inside a tool module:
+
+        def draw_preferences(layout, context, prefs):
+            prefs.prop(layout, "prefix")
+            prefs.prop(layout, "auto_number")
+
+        value = prefs.prefix          # read
+        prefs.prefix = "Bone_"        # write
+    """
+
+    def __init__(self, obj, names):
+        d = self.__dict__
+        d["_obj"] = obj
+        d["_names"] = names
+
+    def __getattr__(self, name):
+        names = self.__dict__["_names"]
+        full = names.get(name)
+        if full is None:
+            raise AttributeError(name)
+        return getattr(self.__dict__["_obj"], full)
+
+    def __setattr__(self, name, value):
+        names = self.__dict__["_names"]
+        full = names.get(name)
+        if full is None:
+            raise AttributeError(name)
+        setattr(self.__dict__["_obj"], full, value)
+
+    def prop(self, layout, name, **kwargs):
+        names = self.__dict__["_names"]
+        full = names.get(name)
+        if full is None:
+            print(
+                f"[XNeko] pref '{name}' not injected. "
+                f"Restart Blender if you just added preference_props."
+            )
+            return None
+        return layout.prop(self.__dict__["_obj"], full, **kwargs)
+
+    def __contains__(self, name):
+        return name in self.__dict__["_names"]
+
+    def keys(self):
+        return self.__dict__["_names"].keys()
+
+
+# ==================================================
+# UI scale helpers
 # ==================================================
 def _get_ui_scale():
-    """Current Blender UI scale (1.0 = default)."""
     try:
         return bpy.context.preferences.system.ui_scale
     except Exception:
@@ -26,7 +137,6 @@ def _get_ui_scale():
 
 
 def _get_usable_width(context):
-    """Estimate the pixel width available inside the preferences panel."""
     width = None
     try:
         screen = context.screen
@@ -46,19 +156,16 @@ def _get_usable_width(context):
         except Exception:
             width = 900
 
-    # Reserve room for the two arrow buttons and padding
     return max(150, width - 130)
 
 
 def _estimate_tab_px(display_text):
-    """Approximate the pixel width of a tab button."""
     scale = _get_ui_scale()
-    # ~7 px per character + icon (~22 px) + button padding (~16 px)
     return int((len(display_text) * 7 + 22 + 16) * scale)
 
 
 # ==================================================
-# Category selector operator
+# Base operators
 # ==================================================
 class XNEKO_OT_set_active_category(bpy.types.Operator):
     bl_idname = "xneko.set_active_category"
@@ -75,9 +182,6 @@ class XNEKO_OT_set_active_category(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ==================================================
-# Tab page shifter operator
-# ==================================================
 class XNEKO_OT_shift_tab_page(bpy.types.Operator):
     bl_idname = "xneko.shift_tab_page"
     bl_label = "Shift Tab Page"
@@ -101,154 +205,754 @@ class XNEKO_OT_shift_tab_page(bpy.types.Operator):
 # Per-tool toggle
 # ==================================================
 class XNekoToolToggle(bpy.types.PropertyGroup):
-    tool_id: StringProperty()
+    tool_id: StringProperty()          # full id
     display_name: StringProperty()
     enabled: BoolProperty(
         default=True,
         update=lambda self, ctx: _on_toggle(self),
     )
+    expanded: BoolProperty(default=False)
 
 
 # ==================================================
-# Addon preferences
+# One row in the Apply Preset dialog
 # ==================================================
-class XNekoPreferences(bpy.types.AddonPreferences):
-    bl_idname = __package__
+class XNEKO_ApplyPresetEntry(bpy.types.PropertyGroup):
+    tool_id: StringProperty()          # full id
+    short_id: StringProperty()         # short id (JSON key)
+    display_name: StringProperty()
+    detail: StringProperty()
+    selected: BoolProperty(default=True)
+    compatible: BoolProperty(default=True)
+    currently_enabled: BoolProperty(default=False)
+    target_enabled: BoolProperty(default=True)
 
-    panel_category: StringProperty(
-        name="N Panel Category",
-        description="Category name shown in the N panel sidebar. "
-                    "Use the same name as another add-on to merge them.",
-        default="XNeko Tools",
-        update=lambda self, ctx: refresh_panel_category(),
+
+# ==================================================
+# Preset enumerator
+# ==================================================
+def _preset_items(self, context):
+    names = preset_store.list_presets()
+    if not names:
+        return [("", "(No presets)", "No preset files found")]
+    return [(n, n, f"Preset: {n}") for n in names]
+
+
+# ==================================================
+# Preference IO operators
+# ==================================================
+class XNEKO_OT_export_prefs(bpy.types.Operator):
+    bl_idname = "xneko.export_prefs"
+    bl_label = "Export Preferences"
+    bl_options = {'INTERNAL'}
+
+    preset_name: StringProperty(
+        name="Preset Name",
+        description="Name to save this preset under",
+        default="",
     )
+    overwrite: BoolProperty(name="Overwrite", default=False)
 
-    active_category: StringProperty(default="")
-
-    tab_page: IntProperty(default=0)
-
-    tool_toggles: CollectionProperty(type=XNekoToolToggle)
+    def invoke(self, context, event):
+        if not self.preset_name:
+            self.preset_name = "Preset"
+        return context.window_manager.invoke_props_dialog(self, width=320)
 
     def draw(self, context):
         layout = self.layout
+        layout.prop(self, "preset_name")
+        name = preset_store.sanitize_name(self.preset_name)
+        if name and preset_store.preset_exists(name):
+            box = layout.box()
+            box.alert = True
+            box.label(text=f"'{name}' already exists", icon='ERROR')
+            box.prop(self, "overwrite")
 
-        # ---------- N panel category input ----------
-        layout.prop(self, "panel_category")
+    def execute(self, context):
+        name = preset_store.sanitize_name(self.preset_name)
+        if not name:
+            self.report({'ERROR'}, "Name cannot be empty")
+            return {'CANCELLED'}
+        if preset_store.preset_exists(name) and not self.overwrite:
+            self.report({'ERROR'}, "Preset exists; enable Overwrite")
+            return {'CANCELLED'}
+        prefs_obj = context.preferences.addons[__package__].preferences
+        data = prefs_io.export_prefs(prefs_obj, core, name=name)
+        preset_store.save_preset(name, data)
+        self.report({'INFO'}, f"Saved preset '{name}'")
+        return {'FINISHED'}
 
-        # ---------- Tools: top tabs / bottom toggles ----------
+
+class XNEKO_OT_import_prefs(bpy.types.Operator, ImportHelper):
+    bl_idname = "xneko.import_prefs"
+    bl_label = "Import Preferences"
+    bl_options = {'INTERNAL'}
+
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+    filename_ext = ".json"
+
+    def execute(self, context):
+        try:
+            data = prefs_io.load_from_file(self.filepath)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        if data.get("format") != prefs_io.FORMAT_TAG:
+            self.report({'ERROR'}, "Not an XNeko preferences file")
+            return {'CANCELLED'}
+
+        base = os.path.basename(self.filepath)
+        target = base[:-5] if base.endswith(".json") else base
+        target = preset_store.sanitize_name(target) or "Imported"
+
+        if preset_store.preset_exists(target):
+            wm = context.window_manager
+            wm["xneko_pending_import_data"] = json.dumps(data, ensure_ascii=False)
+            wm["xneko_pending_import_name"] = target
+            bpy.ops.xneko.confirm_overwrite('INVOKE_DEFAULT')
+            return {'FINISHED'}
+
+        preset_store.save_preset(target, data)
+        self.report({'INFO'}, f"Imported as '{target}'")
+        return {'FINISHED'}
+
+
+class XNEKO_OT_confirm_overwrite(bpy.types.Operator):
+    bl_idname = "xneko.confirm_overwrite"
+    bl_label = "Preset Already Exists"
+    bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context):
+        name = context.window_manager.get("xneko_pending_import_name", "")
+        box = self.layout.box()
+        box.alert = True
+        box.label(text=f"'{name}' already exists", icon='ERROR')
+        self.layout.label(text="Overwrite it?")
+
+    def execute(self, context):
+        wm = context.window_manager
+        name = wm.get("xneko_pending_import_name", "")
+        raw = wm.get("xneko_pending_import_data", "")
+        if not name or not raw:
+            return {'CANCELLED'}
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        preset_store.save_preset(name, data)
+        wm["xneko_pending_import_name"] = ""
+        wm["xneko_pending_import_data"] = ""
+        self.report({'INFO'}, f"Overwritten '{name}'")
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        wm = context.window_manager
+        wm["xneko_pending_import_name"] = ""
+        wm["xneko_pending_import_data"] = ""
+
+
+class XNEKO_OT_apply_preset(bpy.types.Operator):
+    bl_idname = "xneko.apply_preset"
+    bl_label = "Apply Preset"
+    bl_options = {'INTERNAL'}
+
+    preset_name: StringProperty()
+
+    entries: CollectionProperty(type=XNEKO_ApplyPresetEntry)
+
+    _preview_data = None
+
+    def invoke(self, context, event):
+        global _ACTIVE_APPLY_OP
+        if not self.preset_name:
+            self.report({'ERROR'}, "No preset selected")
+            return {'CANCELLED'}
+        try:
+            data = preset_store.load_preset(self.preset_name)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        self._preview_data = data
+        self._build_entries(context, data)
+        _ACTIVE_APPLY_OP = self
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def _build_entries(self, context, data):
+        """Fill the checkbox list from the preset data."""
+        self.entries.clear()
+
+        prefs_obj = context.preferences.addons[__package__].preferences
+        current = {it.tool_id: it.enabled for it in prefs_obj.tool_toggles}
+        short_to_full = _full_id_map()
+
+        for short_id, saved in (data.get("tools") or {}).items():
+            row = self.entries.add()
+            row.short_id = short_id
+            row.target_enabled = bool(saved.get("__enabled__", True))
+
+            full_id = short_to_full.get(short_id)
+            tool = core._TOOL_REGISTRY.get(full_id) if full_id else None
+
+            if tool is None:
+                row.tool_id = short_id
+                row.display_name = short_id
+                row.detail = "Not installed"
+                row.compatible = False
+                row.selected = False
+                continue
+
+            row.tool_id = full_id
+            row.display_name = tool["display_name"]
+            row.currently_enabled = bool(current.get(full_id, False))
+
+            if not tool.get("compatible", True):
+                row.detail = tool.get("incompatible_reason", "Incompatible")
+                row.compatible = False
+                row.selected = False
+            else:
+                row.compatible = True
+                row.selected = True
+
+    def draw(self, context):
+        layout = self.layout
+        data = self._preview_data
+        if data is None:
+            layout.label(text="No data", icon='ERROR')
+            return
+
+        meta = layout.box()
+        meta.label(text=f"Preset: {data.get('name', '?')}", icon='PRESET')
+        row = meta.row()
+        row.label(text=f"Plugin: {data.get('plugin_version', '?')}")
+        row.label(text=f"Blender: {data.get('blender_version', '?')}")
+
         layout.separator()
-        layout.label(text="Tools:")
 
-        # Group all tool toggles by category id
-        groups = {}
-        for item in self.tool_toggles:
-            gid = item.tool_id.rsplit(".", 1)[0] if "." in item.tool_id else ""
-            if gid.startswith("tools."):
-                gid = gid[len("tools."):]
-            groups.setdefault(gid or "(root)", []).append(item)
+        header = layout.row(align=True)
+        header.label(text="Select modules to apply:")
+        header.operator(
+            "xneko.apply_preset_select_all", text="All",
+        ).state = True
+        header.operator(
+            "xneko.apply_preset_select_all", text="None",
+        ).state = False
 
-        if not groups:
-            layout.label(text="No tools found", icon='INFO')
+        box = layout.box()
+        for row in self.entries:
+            if not row.compatible:
+                r = box.row()
+                r.enabled = False
+                r.label(
+                    text=f"{row.display_name}  ({row.detail})",
+                    icon='ERROR',
+                )
+                continue
+
+            r = box.row(align=True)
+            r.prop(row, "selected", text="")
+
+            if row.currently_enabled == row.target_enabled:
+                tag = "(no change)"
+            elif row.target_enabled:
+                tag = "\u2192 enable"
+            else:
+                tag = "\u2192 disable"
+            r.label(text=f"{row.display_name}   {tag}")
+
+    def execute(self, context):
+        global _ACTIVE_APPLY_OP
+        data = self._preview_data
+        self._preview_data = None
+        _ACTIVE_APPLY_OP = None
+
+        if data is None:
+            return {'CANCELLED'}
+
+        prefs_obj = context.preferences.addons[__package__].preferences
+        toggles = {it.tool_id: it for it in prefs_obj.tool_toggles}
+
+        applied = 0
+        skipped = 0
+        for row in self.entries:
+            if not row.compatible or not row.selected:
+                skipped += 1
+                continue
+
+            item = toggles.get(row.tool_id)
+            if item is not None:
+                if item.enabled != row.target_enabled:
+                    # Triggers _on_toggle -> core.set_tool_enabled
+                    item.enabled = row.target_enabled
+                else:
+                    core.set_tool_enabled(row.tool_id, row.target_enabled)
+            else:
+                core.set_tool_enabled(row.tool_id, row.target_enabled)
+            applied += 1
+
+        _redraw_view3d(context)
+        self.report(
+            {'INFO'},
+            f"Applied {applied}, skipped {skipped}",
+        )
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        global _ACTIVE_APPLY_OP
+        _ACTIVE_APPLY_OP = None
+        self._preview_data = None
+
+
+class XNEKO_OT_apply_preset_select_all(bpy.types.Operator):
+    bl_idname = "xneko.apply_preset_select_all"
+    bl_label = "Select All / None"
+    bl_options = {'INTERNAL'}
+
+    state: BoolProperty()
+
+    def execute(self, context):
+        op = _ACTIVE_APPLY_OP
+        if op is None or not hasattr(op, "entries"):
+            return {'CANCELLED'}
+        for row in op.entries:
+            if row.compatible:
+                row.selected = self.state
+        return {'FINISHED'}
+
+
+class XNEKO_OT_delete_preset(bpy.types.Operator):
+    bl_idname = "xneko.delete_preset"
+    bl_label = "Delete Preset"
+    bl_options = {'INTERNAL'}
+
+    preset_name: StringProperty()
+
+    def invoke(self, context, event):
+        if not self.preset_name:
+            return {'CANCELLED'}
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        if not self.preset_name:
+            return {'CANCELLED'}
+        preset_store.delete_preset(self.preset_name)
+        self.report({'INFO'}, f"Deleted '{self.preset_name}'")
+        return {'FINISHED'}
+
+
+class XNEKO_OT_refresh_presets(bpy.types.Operator):
+    bl_idname = "xneko.refresh_presets"
+    bl_label = "Refresh Presets"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class XNEKO_OT_apply_project_prefs(bpy.types.Operator):
+    bl_idname = "xneko.apply_project_prefs"
+    bl_label = "Apply Project Preferences"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        prefs_obj = context.preferences.addons[__package__].preferences
+        data, present = prefs_io.get_project_data()
+        if not present or data is None:
+            self.report({'WARNING'}, "Project has no saved preferences")
+            return {'CANCELLED'}
+        applied, skipped = prefs_io.import_prefs(prefs_obj, core, data)
+        _redraw_view3d(context)
+        self.report(
+            {'INFO'},
+            f"Project prefs: applied {len(applied)}, skipped {len(skipped)}",
+        )
+        return {'FINISHED'}
+
+
+class XNEKO_OT_clear_project_prefs(bpy.types.Operator):
+    bl_idname = "xneko.clear_project_prefs"
+    bl_label = "Clear Project Preferences"
+    bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        prefs_io.clear_project_data()
+        self.report({'INFO'}, "Project preferences cleared")
+        return {'FINISHED'}
+
+
+# ==================================================
+# Toggle / handler callbacks
+# ==================================================
+def _on_save_to_project_toggle(self, context):
+    # Nothing to do on toggle; save_pre handler reads the flag each time.
+    pass
+
+
+def _on_use_project_prefs_toggle(self, context):
+    if not self.use_project_prefs:
+        return
+    data, present = prefs_io.get_project_data()
+    if not present or data is None:
+        return
+    prefs_io.import_prefs(self, core, data)
+    _redraw_view3d(context)
+
+
+@bpy.app.handlers.persistent
+def _on_load_post(dummy):
+    prefs = bpy.context.preferences.addons.get(__package__)
+    if not prefs:
+        return
+    p = prefs.preferences
+
+    # Only act when the user opted in
+    if not p.use_project_prefs:
+        return
+
+    data, present = prefs_io.get_project_data()
+    if not present or data is None:
+        return
+
+    applied, skipped = prefs_io.import_prefs(p, core, data)
+
+    print(f"[XNeko] Loaded project prefs: applied {len(applied)}, "
+          f"skipped {len(skipped)}")
+    for short, reason in skipped:
+        print(f"[XNeko]   skipped {short}: {reason}")
+
+    _redraw_view3d()
+
+
+@bpy.app.handlers.persistent
+def _on_save_pre(dummy):
+    prefs = bpy.context.preferences.addons.get(__package__)
+    if not prefs:
+        return
+    p = prefs.preferences
+    if not p.save_to_project:
+        return
+    data = prefs_io.export_prefs(p, core, name="__project__")
+    prefs_io.set_project_data(data)
+
+
+# ==================================================
+# Addon preferences draw function
+# ==================================================
+def _draw_preferences(self, context):
+    layout = self.layout
+
+    # ---------- N panel category input ----------
+    layout.prop(self, "panel_category")
+
+    # ---------- Project File (collapsible) ----------
+    layout.separator()
+
+    _data, present = prefs_io.get_project_data()
+
+    header = layout.row(align=True)
+    arrow = 'TRIA_DOWN' if self.project_section_expanded else 'TRIA_RIGHT'
+    header.prop(self, "project_section_expanded",
+                text="", icon=arrow, emboss=False)
+    header.label(text="Project File:", icon='FILE_BLEND')
+
+    # Right-aligned clear button (only useful when data exists)
+    spacer = header.row(align=True)
+    spacer.alignment = 'RIGHT'
+    clear_row = spacer.row(align=True)
+    clear_row.enabled = present
+    clear_row.operator("xneko.clear_project_prefs", text="", icon='TRASH')
+
+    if self.project_section_expanded:
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop(self, "save_to_project")
+        col.prop(self, "use_project_prefs")
+
+        info_row = box.row()
+        info_row.enabled = False
+        if present:
+            info_row.label(text="This project carries preferences",
+                           icon='CHECKMARK')
         else:
-            # Fall back to first category if the stored one no longer exists
-            if self.active_category not in groups:
-                self.active_category = list(groups.keys())[0]
+            info_row.label(text="No preferences in this project", icon='INFO')
 
-            # ----- Top: horizontal tab bar with paging arrows -----
-            all_gids = list(groups.keys())
-            total = len(all_gids)
+    # ---------- Presets ----------
+    layout.separator()
+    layout.label(text="Presets:", icon='PRESET')
 
-            # Dynamic tabs-per-page based on available width
-            usable_px = _get_usable_width(context)
+    if self.selected_preset:
+        if self.selected_preset not in preset_store.list_presets():
+            self.selected_preset = ""
 
-            widest_tab_px = 1
-            for gid in all_gids:
-                display_text = gid.replace(".", " / ").replace("_", " ").title()
-                w = _estimate_tab_px(display_text)
-                if w > widest_tab_px:
-                    widest_tab_px = w
+    row = layout.row(align=True)
+    row.prop(self, "selected_preset", text="")
 
-            # Use the widest tab as the reference so no tab ever overflows
-            TABS_PER_PAGE = max(1, usable_px // widest_tab_px)
-            if TABS_PER_PAGE > total:
-                TABS_PER_PAGE = total
+    sub = row.row(align=True)
+    sub.scale_x = 0.45 
+    sub.enabled = bool(self.selected_preset)
+    sub.operator(
+        "xneko.apply_preset", text="Apply", icon='CHECKMARK',
+    ).preset_name = self.selected_preset
+    sub.operator(
+        "xneko.delete_preset", text="Delete", icon='TRASH',
+    ).preset_name = self.selected_preset
 
-            page_count = max(1, (total + TABS_PER_PAGE - 1) // TABS_PER_PAGE)
+    row = layout.row(align=True)
+    row.operator("xneko.export_prefs", text="Export", icon='EXPORT')
+    row.operator("xneko.import_prefs", text="Import", icon='IMPORT')
+    row.operator("xneko.refresh_presets", text="", icon='FILE_REFRESH')
 
-            # Clamp stored page to valid range
-            if self.tab_page >= page_count:
-                self.tab_page = page_count - 1
-            if self.tab_page < 0:
-                self.tab_page = 0
+    # ---------- Tools ----------
+    layout.separator()
+    layout.label(text="Tools:")
 
-            start = self.tab_page * TABS_PER_PAGE
-            end = min(start + TABS_PER_PAGE, total)
-            visible_gids = all_gids[start:end]
+    groups = {}
+    for item in self.tool_toggles:
+        tool = core._TOOL_REGISTRY.get(item.tool_id)
+        gid = tool["group_id"] if tool else ""
+        groups.setdefault(gid or "(root)", []).append(item)
 
-            # One single row: [<] tab tab tab [>]
-            tab_row = layout.row(align=True)
+    if not groups:
+        layout.label(text="No tools found", icon='INFO')
+    else:
+        if self.active_category not in groups:
+            self.active_category = list(groups.keys())[0]
 
-            left = tab_row.row(align=True)
-            left.enabled = self.tab_page > 0
-            left.operator(
-                "xneko.shift_tab_page",
-                text="",
-                icon='TRIA_LEFT',
-            ).delta = -1
+        all_gids = list(groups.keys())
+        total = len(all_gids)
 
-            for gid in visible_gids:
-                display = gid.replace(".", " / ").replace("_", " ").title()
-                is_active = (self.active_category == gid)
-                tab_row.operator(
-                    "xneko.set_active_category",
-                    text=display,
-                    icon=core._get_group_icon(gid),
-                    depress=is_active,
-                ).category = gid
+        usable_px = _get_usable_width(context)
 
-            right = tab_row.row(align=True)
-            right.enabled = self.tab_page < page_count - 1
-            right.operator(
-                "xneko.shift_tab_page",
-                text="",
-                icon='TRIA_RIGHT',
-            ).delta = 1
+        widest_tab_px = 1
+        for gid in all_gids:
+            display_text = gid.replace(".", " / ").replace("_", " ").title()
+            w = _estimate_tab_px(display_text)
+            if w > widest_tab_px:
+                widest_tab_px = w
 
-            # ----- Bottom: toggles of the active category -----
-            box = layout.box()
-            for item in groups[self.active_category]:
-                box.prop(item, "enabled", text=item.display_name)
+        TABS_PER_PAGE = max(1, usable_px // widest_tab_px)
+        if TABS_PER_PAGE > total:
+            TABS_PER_PAGE = total
 
-        # ---------- Links ----------
-        layout.separator()
-        layout.label(text="Links:", icon='BOOKMARKS')
+        page_count = max(1, (total + TABS_PER_PAGE - 1) // TABS_PER_PAGE)
+        if self.tab_page >= page_count:
+            self.tab_page = page_count - 1
+        if self.tab_page < 0:
+            self.tab_page = 0
 
-        by_author = {}
-        for label, url, icon, author in LINKS:
-            by_author.setdefault(author, []).append((label, url, icon))
+        start = self.tab_page * TABS_PER_PAGE
+        end = min(start + TABS_PER_PAGE, total)
+        visible_gids = all_gids[start:end]
 
-        for author, items in by_author.items():
-            box = layout.box()
-            box.label(text=author, icon='USER')
-            grid = box.grid_flow(row_major=True, columns=2, even_columns=True)
-            for label, url, icon in items:
-                grid.operator("wm.url_open", text=label, icon=icon).url = url
+        tab_row = layout.row(align=True)
+
+        left = tab_row.row(align=True)
+        left.enabled = self.tab_page > 0
+        left.operator(
+            "xneko.shift_tab_page", text="", icon='TRIA_LEFT',
+        ).delta = -1
+
+        for gid in visible_gids:
+            display = gid.replace(".", " / ").replace("_", " ").title()
+            is_active = (self.active_category == gid)
+            tab_row.operator(
+                "xneko.set_active_category",
+                text=display,
+                icon=core._get_group_icon(gid),
+                depress=is_active,
+            ).category = gid
+
+        right = tab_row.row(align=True)
+        right.enabled = self.tab_page < page_count - 1
+        right.operator(
+            "xneko.shift_tab_page", text="", icon='TRIA_RIGHT',
+        ).delta = 1
+
+        # ----- Toggles + per-tool preferences (collapsible) -----
+        main_box = layout.box()
+        for item in groups[self.active_category]:
+            tool = core._TOOL_REGISTRY.get(item.tool_id)
+
+            # Version-incompatible tools: disabled toggle + reason.
+            if tool and not tool.get("compatible", True):
+                row = main_box.row(align=True)
+                row.enabled = False
+                row.label(text="", icon='BLANK1')
+                row.prop(item, "enabled", text=item.display_name)
+                warn = main_box.row()
+                warn.alert = True
+                warn.label(text=tool["incompatible_reason"], icon='ERROR')
+                continue
+
+            has_props = bool(tool.get("preference_props")) if tool else False
+            has_draw = callable(tool.get("draw_preferences")) if tool else False
+            can_expand = (
+                tool is not None
+                and item.enabled
+                and tool.get("preferences_in_addon") is not False
+                and (has_props or has_draw)
+            )
+
+            row = main_box.row(align=True)
+            if can_expand:
+                arrow = 'TRIA_DOWN' if item.expanded else 'TRIA_RIGHT'
+                row.prop(item, "expanded", text="", icon=arrow, emboss=False)
+            else:
+                row.label(text="", icon='BLANK1')
+            row.prop(item, "enabled", text=item.display_name)
+
+            if not can_expand or not item.expanded:
+                continue
+
+            ns = _make_tool_namespace(tool)
+            if ns is None:
+                continue
+
+            sub_box = main_box.box()
+            if has_draw:
+                try:
+                    tool["draw_preferences"](sub_box, context, ns)
+                except Exception as e:
+                    sub_box.label(text=f"Prefs error: {e}", icon='ERROR')
+            else:
+                for name in tool["preference_props"]:
+                    ns.prop(sub_box, name)
+
+    # ---------- Links ----------
+    layout.separator()
+    layout.label(text="Links:", icon='BOOKMARKS')
+
+    by_author = {}
+    for label, url, icon, author in LINKS:
+        by_author.setdefault(author, []).append((label, url, icon))
+
+    for author, items in by_author.items():
+        box = layout.box()
+        box.label(text=author, icon='USER')
+        grid = box.grid_flow(row_major=True, columns=2, even_columns=True)
+        for label, url, icon in items:
+            grid.operator("wm.url_open", text=label, icon=icon).url = url
+
+
+# ==================================================
+# Dynamic preferences class builder
+# ==================================================
+XNekoPreferences = None
+
+
+def build_preferences_class():
+    """Construct XNekoPreferences with tool preference props baked
+    into __annotations__.
+
+    Must be called after core.discover_tools() and before
+    bpy.utils.register_class(XNekoPreferences).
+    """
+    annotations = {
+        "panel_category": StringProperty(
+            name="N Panel Category",
+            description=(
+                "Category name shown in the N panel sidebar. "
+                "Use the same name as another add-on to merge them."
+            ),
+            default="XNeko Tools",
+            update=lambda self, ctx: refresh_panel_category(),
+        ),
+        "active_category": StringProperty(default=""),
+        "tab_page": IntProperty(default=0),
+        "tool_toggles": CollectionProperty(type=XNekoToolToggle),
+
+        "project_section_expanded": BoolProperty(default=False),
+
+        # Project-file sync
+        "save_to_project": BoolProperty(
+            name="Save Preferences to .blend",
+            description=(
+                "When saving the .blend, also store the current "
+                "preferences inside the project file"
+            ),
+            default=False,
+            update=lambda self, ctx: _on_save_to_project_toggle(self, ctx),
+        ),
+        "use_project_prefs": BoolProperty(
+            name="Use Project Preferences",
+            description=(
+                "When loading a .blend that stores preferences, "
+                "apply them instead of using the addon defaults"
+            ),
+            default=False,
+            update=lambda self, ctx: _on_use_project_prefs_toggle(self, ctx),
+        ),
+
+        # Preset selector
+        "selected_preset": EnumProperty(
+            name="Preset",
+            items=_preset_items,
+            description="Preset to apply",
+        ),
+    }
+
+    for tool_id, tool in core._TOOL_REGISTRY.items():
+        prefix = _make_pref_prefix(tool_id)
+        names = {}
+        for name, prop in tool.get("preference_props", {}).items():
+            full = prefix + name
+            names[name] = full
+            annotations[full] = prop
+        tool["_pref_names"] = names
+
+    return type(
+        "XNekoPreferences",
+        (bpy.types.AddonPreferences,),
+        {
+            "bl_idname": __package__,
+            "__annotations__": annotations,
+            "draw": _draw_preferences,
+        },
+    )
+
+
+def _make_tool_namespace(tool):
+    prefs = bpy.context.preferences.addons.get(__package__)
+    if not prefs:
+        return None
+    names = tool.get("_pref_names")
+    if not names:
+        return None
+    return _ToolPrefNamespace(prefs.preferences, names)
+
+
+def get_tool_prefs(tool_id):
+    """Public accessor for tools to read/write their own prefs."""
+    tool = core._TOOL_REGISTRY.get(tool_id)
+    if tool is None:
+        return None
+    return _make_tool_namespace(tool)
 
 
 # ==================================================
 # Callbacks
 # ==================================================
 def _on_toggle(item):
-    if item.enabled:
-        core.load_tool(item.tool_id)
-    else:
-        core.unload_tool(item.tool_id)
+    tool = core._TOOL_REGISTRY.get(item.tool_id)
+    if tool is None:
+        return
 
-    screen = bpy.context.screen
-    if screen is not None:
-        for area in screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
+    if item.enabled and not tool.get("compatible", True):
+        item.enabled = False
+        print(f"[XNeko] {item.tool_id} cannot be enabled: "
+              f"{tool['incompatible_reason']}")
+        return
+
+    core.set_tool_enabled(item.tool_id, item.enabled)
+    _redraw_view3d()
 
 
 def init_tool_toggles():
@@ -261,7 +965,10 @@ def init_tool_toggles():
         item = p.tool_toggles.add()
         item.tool_id = tool_id
         item.display_name = tool["display_name"]
-        item.enabled = tool["enabled_by_default"]
+        if tool.get("compatible", True):
+            item.enabled = tool["enabled_by_default"]
+        else:
+            item.enabled = False
 
 
 def clear_tool_toggles():
@@ -277,7 +984,8 @@ def refresh_panel_category():
     if not prefs:
         return
 
-    category = (prefs.preferences.panel_category or "XNeko Tools").strip() or "XNeko Tools"
+    category = (prefs.preferences.panel_category or "XNeko Tools").strip() \
+        or "XNeko Tools"
 
     all_panels = list(core._GROUP_PANEL_CLASSES)
 

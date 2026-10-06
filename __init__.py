@@ -1,13 +1,10 @@
 # ============================================================
 # Add-on metadata
-# ------------------------------------------------------------
-# bl_info is read by Blender when scanning the add-ons folder.
-# It defines the entry shown in Edit > Preferences > Add-ons.
 # ============================================================
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (
@@ -20,77 +17,158 @@ bl_info = {
 
 import bpy
 
-# Local submodules of this package
-from . import core         # engine: discovery, registration, grouping
-from . import preferences  # add-on preferences UI and per-tool toggles
+from . import core
+from . import preferences
+
+
+# ============================================================
+# Preference-class helpers
+# ------------------------------------------------------------
+# Tools may declare `preference_classes` — PropertyGroups that
+# must be registered *before* XNekoPreferences, because some
+# preference_props may be PointerProperty targeting them.
+# ============================================================
+def _register_preference_classes():
+    for tool in core._TOOL_REGISTRY.values():
+        for cls in tool.get("preference_classes", ()):
+            if not isinstance(cls, type):
+                continue
+            try:
+                bpy.utils.register_class(cls)
+            except Exception as e:
+                print(f"[XNeko] preference class {cls.__name__} failed: {e}")
+
+
+def _unregister_preference_classes():
+    for tool in reversed(list(core._TOOL_REGISTRY.values())):
+        for cls in reversed(tool.get("preference_classes", ())):
+            if not isinstance(cls, type):
+                continue
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                pass
 
 
 # ============================================================
 # register()
 # ------------------------------------------------------------
-# Called by Blender when the add-on is enabled.
-#
-# Order matters:
-#   1. PropertyGroups must exist before anything references them.
-#   2. Tools must be discovered before group panels are built.
-#   3. Group panels must be registered before tool panels are
-#      attached to them as children.
-#   4. Tool toggles must be initialised before the category is
-#      refreshed, so the tab list is complete.
-#   5. Default tools are loaded last, once everything is ready.
+# Order:
+#   1. Discover tool modules on disk.
+#   2. Register their preference helper PropertyGroups.
+#   3. Build XNekoPreferences dynamically (props must be in
+#      __annotations__ before register_class).
+#   4. Register base classes.
+#   5. Build group panels, then attach tool panels to them.
+#   6. Init toggle list, refresh category, load defaults.
 # ============================================================
 def register():
-    # ---- 1. Base classes (PropertyGroups + preferences) ----
+    # ---- 1. Discovery ----
+    core.discover_tools(__name__, __path__)
+
+    # ---- 2. Tool-owned PropertyGroups used by preferences ----
+    _register_preference_classes()
+
+    # ---- 3. Base operator / property classes ----
     bpy.utils.register_class(preferences.XNEKO_OT_set_active_category)
     bpy.utils.register_class(preferences.XNEKO_OT_shift_tab_page)
     bpy.utils.register_class(preferences.XNekoToolToggle)
+    bpy.utils.register_class(preferences.XNEKO_ApplyPresetEntry)
+
+    # ---- 4. Build XNekoPreferences with dynamic per-tool props ----
+    preferences.XNekoPreferences = preferences.build_preferences_class()
     bpy.utils.register_class(preferences.XNekoPreferences)
 
-    # ---- 2. Discover all tool modules under tools/ ----
-    # Populates core._TOOL_REGISTRY from the file system.
-    core.discover_tools(__name__, __path__)
-
-    # ---- 3. Build collapsible group panels (one per category) ----
+    # ---- 5. Panels ----
     core.register_group_panels()
-
-    # ---- 4. Attach each tool's Panel to its group panel ----
-    # Also forces all child panels to be collapsed by default.
     core.attach_panels_to_groups()
 
-    # ---- 5. Populate the per-tool toggle list in preferences ----
-    # Must happen after discovery, before any refresh calls.
+    # ---- 6. Toggles + category + defaults ----
     preferences.init_tool_toggles()
-
-    # ---- 6. Apply the category name to every registered panel ----
     preferences.refresh_panel_category()
-
-    # ---- 7. Load the tools that are enabled by default ----
     core.load_default_tools()
+
+    # ---- 7. Preference IO operators ----
+    for name in (
+        "XNEKO_OT_export_prefs",
+        "XNEKO_OT_import_prefs",
+        "XNEKO_OT_confirm_overwrite",
+        "XNEKO_OT_apply_preset",
+        "XNEKO_OT_apply_preset_select_all",
+        "XNEKO_OT_delete_preset",
+        "XNEKO_OT_refresh_presets",
+        "XNEKO_OT_apply_project_prefs",
+        "XNEKO_OT_clear_project_prefs",
+    ):
+        cls = getattr(preferences, name, None)
+        if cls is None:
+            print(f"[XNeko] missing operator: {name}")
+            continue
+        try:
+            bpy.utils.register_class(cls)
+        except Exception as e:
+            print(f"[XNeko] register {name} failed: {e}")
+
+    # ---- 8. Handlers ----
+    bpy.app.handlers.load_post.append(preferences._on_load_post)
+    bpy.app.handlers.save_pre.append(preferences._on_save_pre)
 
 
 # ============================================================
 # unregister()
-# ------------------------------------------------------------
-# Called by Blender when the add-on is disabled.
-#
-# Reverse order of register():
-#   1. Unload every tool (removes its classes + scene props).
-#   2. Clear stored toggle list from preferences.
-#   3. Remove group panels.
-#   4. Unregister the base classes last.
 # ============================================================
 def unregister():
-    # ---- 1. Unload every tool currently loaded ----
+    # ---- 0. Handlers first ----
+    try:
+        bpy.app.handlers.save_pre.remove(preferences._on_save_pre)
+    except Exception:
+        pass
+    try:
+        bpy.app.handlers.load_post.remove(preferences._on_load_post)
+    except Exception:
+        pass
+
+    # ---- 1. Preference IO operators ----
+    for name in (
+        "XNEKO_OT_clear_project_prefs",
+        "XNEKO_OT_apply_project_prefs",
+        "XNEKO_OT_refresh_presets",
+        "XNEKO_OT_delete_preset",
+        "XNEKO_OT_apply_preset",
+        "XNEKO_OT_apply_preset_select_all",
+        "XNEKO_OT_confirm_overwrite",
+        "XNEKO_OT_import_prefs",
+        "XNEKO_OT_export_prefs",
+    ):
+        cls = getattr(preferences, name, None)
+        if cls is None:
+            continue
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+
+    # ---- 2. Unload every loaded tool ----
     core.unload_all_tools()
 
-    # ---- 2. Wipe the stored toggle list ----
+    # ---- 3. Clear toggle list ----
     preferences.clear_tool_toggles()
 
-    # ---- 3. Remove all group (category) panels ----
+    # ---- 4. Remove group panels ----
     core.unregister_group_panels()
 
-    # ---- 4. Unregister base classes (reverse of register order) ----
-    bpy.utils.unregister_class(preferences.XNekoPreferences)
+    # ---- 5. Base classes (reverse of registration) ----
+    if preferences.XNekoPreferences is not None:
+        try:
+            bpy.utils.unregister_class(preferences.XNekoPreferences)
+        except Exception:
+            pass
+        preferences.XNekoPreferences = None
+
+    bpy.utils.unregister_class(preferences.XNEKO_ApplyPresetEntry)
     bpy.utils.unregister_class(preferences.XNekoToolToggle)
-    bpy.utils.unregister_class(preferences.XNEKO_OT_shift_tab_page) 
+    bpy.utils.unregister_class(preferences.XNEKO_OT_shift_tab_page)
     bpy.utils.unregister_class(preferences.XNEKO_OT_set_active_category)
+
+    # ---- 6. Preference helper PropertyGroups ----
+    _unregister_preference_classes()
