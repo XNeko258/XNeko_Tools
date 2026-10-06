@@ -1,26 +1,67 @@
 import bpy
+from bpy.props import BoolProperty
 
-
+# ------------------------------------------------------------
+# XNeko Tools metadata
+# ------------------------------------------------------------
 tool_name = "Swap Shapekey with Basis"
 tool_default_enabled = True
+blender_version_min = (4, 1, 0)  # Requires ShapeKey.points
+
+preference_props = {
+    "reset_values_after_swap": BoolProperty(
+        name="Reset Values After Swap",
+        description="Set all shape key values to 0 after swapping",
+        default=True,
+    ),
+}
 
 
-# ---------------- UI List ----------------
-class SHAPEKEY_UL_list(bpy.types.UIList):
-    def draw_item(self, context, layout, data, item, icon,
-                  active_data, active_propname, index):
-        if self.layout_type in {'DEFAULT', 'COMPACT'}:
-            row = layout.row(align=True)
-            row.prop(item, "value", text="")
-            row.prop(item, "name", text="", emboss=False,
-                     icon='SHAPEKEY_DATA')
-            row.prop(item, "mute", text="")
-        elif self.layout_type == 'GRID':
-            layout.alignment = 'CENTER'
-            layout.label(text="", icon='SHAPEKEY_DATA')
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def _get_prefs():
+    """Return this tool's preference namespace, or None."""
+    import importlib
+    top = __name__.split(".")[0]
+    try:
+        prefs_mod = importlib.import_module(top + ".preferences")
+    except ImportError:
+        return None
+    return prefs_mod.get_tool_prefs(__name__)
 
 
-# ---------------- Operator ----------------
+def _find_active_shape_key(obj):
+    """
+    Return the currently selected non-Basis shape key,
+    or None if no valid selection exists.
+    """
+    sk = obj.data.shape_keys
+    if sk is None:
+        return None
+
+    key_blocks = sk.key_blocks
+    if len(key_blocks) < 2:
+        return None
+
+    # Try the official active index first
+    idx = obj.active_shape_key_index
+    if 0 < idx < len(key_blocks):
+        return key_blocks[idx]
+
+    # Fallback: scan for the key with the highest value > 0
+    best = None
+    best_val = 0.0
+    for kb in key_blocks[1:]:  # skip Basis
+        if kb.value > best_val:
+            best_val = kb.value
+            best = kb
+    return best
+
+
+# ------------------------------------------------------------
+# Operator
+# ------------------------------------------------------------
 class MESH_OT_swap_shapekey_with_basis(bpy.types.Operator):
     bl_idname = "xneko.swap_shapekey_with_basis"
     bl_label = "Swap Shapekey with Basis"
@@ -38,55 +79,59 @@ class MESH_OT_swap_shapekey_with_basis(bpy.types.Operator):
             return False
         if obj.data.shape_keys is None:
             return False
-        key_blocks = obj.data.shape_keys.key_blocks
-        if len(key_blocks) < 2:
+        if len(obj.data.shape_keys.key_blocks) < 2:
             return False
-        idx = obj.active_shape_key_index
-        return 0 < idx < len(key_blocks)
+        return _find_active_shape_key(obj) is not None
 
     def execute(self, context):
         obj = context.object
         shape_keys = obj.data.shape_keys
         key_blocks = shape_keys.key_blocks
-        active_index = obj.active_shape_key_index
 
-        # ---------- Defensive checks ----------
-        if not 0 < active_index < len(key_blocks):
+        # ---------- Resolve target ----------
+        basis = key_blocks[0]
+        target = _find_active_shape_key(obj)
+
+        if target is None:
             self.report({'ERROR'}, "Please select a non-Basis shape key")
             return {'CANCELLED'}
 
-        basis = key_blocks[0]
-        target = key_blocks[active_index]
         target_name = target.name
 
+        # ---------- Validation ----------
         vertex_count = len(basis.data)
         if vertex_count == 0:
             self.report({'ERROR'}, "Mesh has no vertices")
             return {'CANCELLED'}
 
         if vertex_count != len(target.data):
-            self.report({'ERROR'},
-                        "Vertex count mismatch between Basis and target")
+            self.report(
+                {'ERROR'},
+                "Vertex count mismatch between Basis and target",
+            )
             return {'CANCELLED'}
 
-        # ---------- Fast bulk swap ----------
+        # ---------- Fast bulk swap via ShapeKey.points ----------
         flat_len = vertex_count * 3
         basis_coords = [0.0] * flat_len
         target_coords = [0.0] * flat_len
 
-        basis.data.foreach_get("co", basis_coords)
-        target.data.foreach_get("co", target_coords)
+        # ShapeKey.points is optimized for foreach_get/set in Blender 4.1+
+        basis.points.foreach_get("co", basis_coords)
+        target.points.foreach_get("co", target_coords)
 
-        basis.data.foreach_set("co", target_coords)
-        target.data.foreach_set("co", basis_coords)
+        basis.points.foreach_set("co", target_coords)
+        target.points.foreach_set("co", basis_coords)
 
-        # ---------- Reset values so visible shape = new Basis ----------
-        for kb in key_blocks:
-            kb.value = 0.0
+        # ---------- Optionally reset values ----------
+        prefs = _get_prefs()
+        if prefs and prefs.reset_values_after_swap:
+            for kb in key_blocks:
+                kb.value = 0.0
 
         obj.data.update_tag()
 
-        # ---------- Rebuild Blender's internal reference mesh ----------
+        # ---------- Rebuild reference mesh ----------
         self._rebuild_reference_mesh(context, obj)
 
         self.report({'INFO'}, f"Swapped Basis with '{target_name}'")
@@ -101,7 +146,6 @@ class MESH_OT_swap_shapekey_with_basis(bpy.types.Operator):
         """
         view_layer = context.view_layer
 
-        # Make sure we are in Object mode before toggling
         if obj.mode != 'OBJECT':
             try:
                 bpy.ops.object.mode_set(mode='OBJECT')
@@ -127,28 +171,59 @@ class MESH_OT_swap_shapekey_with_basis(bpy.types.Operator):
                 pass
 
 
-# ---------------- Panel ----------------
+# ------------------------------------------------------------
+# UI List
+# ------------------------------------------------------------
+class SHAPEKEY_UL_list(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon,
+                  active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, "value", text="")
+            row.prop(item, "name", text="", emboss=False,
+                     icon='SHAPEKEY_DATA')
+            row.prop(item, "mute", text="")
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='SHAPEKEY_DATA')
+
+
+# ------------------------------------------------------------
+# Panel
+# ------------------------------------------------------------
 class VIEW3D_PT_shapekey_apply_to_basis(bpy.types.Panel):
     bl_label = "Swap Shapekey with Basis"
     bl_idname = "VIEW3D_PT_shapekey_apply_to_basis"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
 
-    @classmethod
-    def poll(cls, context):
-        obj = context.object
-        return (
-            obj is not None
-            and obj.type == 'MESH'
-            and obj.data.shape_keys is not None
-        )
+    # No poll -> the panel header is always visible.
 
     def draw(self, context):
         layout = self.layout
         obj = context.object
+
+        # Case 1: nothing selected / no active object
+        if obj is None:
+            box = layout.box()
+            box.label(text="No object selected", icon='INFO')
+            return
+
+        # Case 2: selected object is not a mesh
+        if obj.type != 'MESH':
+            box = layout.box()
+            box.label(text="Not a mesh object", icon='INFO')
+            return
+
+        # Case 3: mesh without shape keys
+        if obj.data.shape_keys is None:
+            box = layout.box()
+            box.label(text="No shape keys", icon='INFO')
+            return
+
+        # Case 4: normal — mesh with shape keys
         key_blocks = obj.data.shape_keys.key_blocks
 
-        # ---------- Shape key list (synced with Properties panel) ----------
         row = layout.row()
         row.template_list(
             "SHAPEKEY_UL_list", "shapekey_list",
@@ -159,20 +234,15 @@ class VIEW3D_PT_shapekey_apply_to_basis(bpy.types.Panel):
 
         layout.separator()
 
-        # ---------- Selected info ----------
-        active_index = obj.active_shape_key_index
+        target = _find_active_shape_key(obj)
         box = layout.box()
-        if 0 < active_index < len(key_blocks):
-            box.label(
-                text=f"Selected: {key_blocks[active_index].name}",
-                icon='SHAPEKEY_DATA',
-            )
+        if target is not None:
+            box.label(text=f"Selected: {target.name}", icon='SHAPEKEY_DATA')
             box.label(text="Will be swapped with Basis",
                       icon='ARROW_LEFTRIGHT')
         else:
             box.label(text="Select a non-Basis shape key", icon='INFO')
 
-        # ---------- Swap button ----------
         layout.separator()
         layout.operator(
             "xneko.swap_shapekey_with_basis",
