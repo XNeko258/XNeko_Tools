@@ -1,28 +1,10 @@
 # Development Guide
 
-This guide explains how to create new tool modules for XNeko Tools.
+This guide describes how to write tool modules for XNeko Tools.
 
-XNeko Tools uses a modular discovery system. Each tool lives under `tools/` as either a single `.py` file or a package. The framework automatically registers operators, panels, preferences, scene properties, and lifecycle hooks declared by the module.
-
----
-
-## Table of Contents
-
-- [1. Directory Structure](#1-directory-structure)
-- [2. Minimal Runnable Module](#2-minimal-runnable-module)
-- [3. Metadata Reference](#3-metadata-reference)
-- [4. Preferences](#4-preferences)
-  - [4.1 Declaration](#41-declaration)
-  - [4.2 Read / Write](#42-read--write)
-  - [4.3 Drawing to UI](#43-drawing-to-ui)
-  - [4.4 Custom Preference UI](#44-custom-preference-ui)
-  - [4.5 Where Preferences Appear](#45-where-preferences-appear)
-- [5. Version Compatibility](#5-version-compatibility)
-- [6. Lifecycle Hooks](#6-lifecycle-hooks)
-- [7. Scene Properties](#7-scene-properties)
-- [8. Complex Modules (Packages)](#8-complex-modules-packages)
-- [9. Shared Code](#9-shared-code)
-- [10. Troubleshooting Checklist](#10-troubleshooting-checklist)
+The framework discovers tool modules under `tools/` and registers their
+operators and panels automatically. Tool enable/disable state is stored by
+the framework and can be exported as a preset.
 
 ---
 
@@ -33,30 +15,33 @@ XNeko_Tools/
 ├── __init__.py
 ├── core.py
 ├── preferences.py
-├── common/                    ← Shared code (not a tool)
+├── common/                    ← shared code (not a tool)
 │   ├── __init__.py
 │   ├── prefs_io.py
 │   └── preset_store.py
-├── presets/                   ← Preset JSON files (not tools)
+├── presets/                   ← preset JSON (not a tool)
 │   └── *.json
-└── tools/                     ← Tool modules only
+└── tools/                     ← tool modules only
     ├── mesh_tools/
     │   └── clean_groups.py
     ├── bone_tools/
     │   └── quick_rotate.py
     └── object_tools/
-        └── advanced_transform/    ← Complex modules use a package
+        └── advanced_transform/    ← packages are allowed
             ├── __init__.py
             ├── _operators.py
             └── _panels.py
 ```
 
-**Rules:**
+**Rules**
 
-- Each folder under `tools/` is a group. Groups appear as tabs in the add-on preferences.
-- Multi-level nesting is supported: `tools/rig/constraints/xxx.py` → group name `Rig / Constraints`.
-- Files or package names starting with `_` are skipped. They can be used as helper files.
-- A `.py` file without a `classes` tuple is skipped. It can be used as a utility library.
+- Each folder under `tools/` becomes a group. Groups appear as tabs in
+  the add-on preferences.
+- Multi-level nesting is supported. `tools/rig/constraints/xxx.py` maps to
+  the group `Rig / Constraints`.
+- Files or packages starting with `_` are skipped. Use this for helpers.
+- A `.py` file without a `classes` tuple is skipped. Use this for utility
+  libraries.
 - `common/` and `presets/` are never treated as tools.
 
 ---
@@ -99,9 +84,10 @@ classes = (
 )
 ```
 
-Save the file, then cold restart Blender. The new module will appear in the N-panel.
+Save, then cold restart Blender. The tool appears in the N-panel.
 
-> **Do not manually set `bl_category` or `bl_parent_id`.** The framework assigns them automatically during registration.
+> **Do not set `bl_category` or `bl_parent_id` manually.** The framework
+> assigns them during registration.
 
 ---
 
@@ -110,25 +96,52 @@ Save the file, then cold restart Blender. The new module will appear in the N-pa
 All metadata are module-level variables placed at the top of the file.
 
 | Field | Type | Default | Description |
-| --- | --- | --- | --- |
+| ----- | ---- | ------- | ----------- |
 | `classes` | `tuple` | — | **Required.** Blender classes to register. |
-| `tool_name` | `str` | File name converted to Title Case | Display name. |
-| `tool_default_enabled` | `bool` | `True` | Whether the tool is enabled by default on first install. |
+| `tool_name` | `str` | Title Case of file name | Display name. |
+| `tool_default_enabled` | `bool` | `True` | Whether the tool starts enabled on a fresh install. |
 | `blender_version_min` | `tuple` | None | Minimum Blender version, e.g. `(4, 0, 0)`. |
-| `blender_version_max` | `tuple` | None | Maximum supported Blender version (inclusive). |
-| `preference_props` | `dict` | `{}` | Preference properties for the tool. |
-| `preference_classes` | `tuple` | `()` | PropertyGroup classes required by preference properties. |
-| `preferences_in_addon` | `bool` | `True` | If `False`, preference UI only appears in the N-panel. |
+| `blender_version_max` | `tuple` | None | Maximum Blender version (inclusive). |
+| `preference_props` | `dict` | `{}` | Per-tool settings shown in the add-on preferences. |
+| `preference_classes` | `tuple` | `()` | PropertyGroups required by preference properties. |
+| `preferences_in_addon` | `bool` | `True` | If `False`, the per-tool settings UI is not shown in the add-on preferences. |
 | `draw_preferences` | `callable` | None | Custom preference UI. |
 | `scene_props` | `dict` | `{}` | Properties attached to `bpy.types.Scene`. |
 | `on_load` | `callable` | None | Called when the module is enabled. |
-| `on_unload` | `callable` | None | Called when the module is disabled. Use this to clean up resources. |
+| `on_unload` | `callable` | None | Called when the module is disabled. Use for cleanup. |
 
 ---
 
-## 4. Preferences
+## 4. Choosing Between `preference_props` and `scene_props`
 
-### 4.1 Declaration
+This distinction matters because presets only record the enabled/disabled
+state of tools, not the value of their settings.
+
+**Use `preference_props` when:**
+
+- the value is a persistent configuration for the tool
+- the value should survive across sessions
+- the value is edited from the add-on preferences panel
+
+**Use `scene_props` when:**
+
+- the value is a per-operation parameter, such as "clean empty groups this time"
+- the value should be scoped to the scene / project
+- the value should not follow the user across projects
+
+Do not put temporary operation parameters into `preference_props`.
+
+> The old advice to set `preferences_in_addon = False` to hide the UI in
+> the add-on panel also removed the properties from the add-on preferences
+> store, which prevented the preset system from reaching them. Avoid
+> `preferences_in_addon = False` in new modules. If you want a clean
+> add-on preferences panel, define an empty `draw_preferences` instead.
+
+---
+
+## 5. Preferences
+
+### 5.1 Declaration
 
 ```python
 from bpy.props import StringProperty, BoolProperty, IntProperty
@@ -140,10 +153,11 @@ preference_props = {
 }
 ```
 
-### 4.2 Read / Write
+### 5.2 Read / Write
 
 ```python
 import importlib
+
 
 def _get_prefs():
     top = __name__.split(".")[0]
@@ -153,30 +167,28 @@ def _get_prefs():
         return None
     return mod.get_tool_prefs(__name__)
 
-# Read
-prefs = _get_prefs()
-value = prefs.prefix          # "Bone_"
 
-# Write
-prefs.prefix = "Bone_"
+prefs = _get_prefs()
+value = prefs.prefix          # read
+prefs.prefix = "Bone_"        # write
 ```
 
-### 4.3 Drawing to UI
+### 5.3 Drawing
 
-**Correct:**
+**Correct**
 
 ```python
 prefs.prop(layout, "prefix")
 prefs.prop(layout, "auto_number", text="Use Numbers", icon='SORTALPHA')
 ```
 
-**Incorrect** (does not raise an error, but draws nothing):
+**Incorrect** — does not raise an error, but draws nothing:
 
 ```python
-layout.prop(prefs, "prefix")   # ❌ prefs is not an RNA object
+layout.prop(prefs, "prefix")   # prefs is not an RNA object
 ```
 
-### 4.4 Custom Preference UI
+### 5.4 Custom preference UI
 
 ```python
 def draw_preferences(layout, context, prefs):
@@ -186,45 +198,49 @@ def draw_preferences(layout, context, prefs):
     prefs.prop(col, "auto_number")
 ```
 
-Once declared, `preference_props` is no longer expanded automatically. You are fully responsible for drawing the UI.
+Declaring `draw_preferences` disables the automatic expansion of
+`preference_props` in the add-on preferences panel. You are then fully
+responsible for drawing the UI.
 
-### 4.5 Where Preferences Appear
-
-| Goal | Configuration |
-| --- | --- |
-| Show in the add-on preferences panel (default) | Nothing to write. |
-| Show only in the N-panel | `preferences_in_addon = False` |
-| Show in both places | Keep the default and call `prefs.prop(...)` inside `Panel.draw`. |
-
----
-
-## 5. Version Compatibility
+Use an empty function to keep the panel clean while keeping the
+properties registered:
 
 ```python
-blender_version_min = (4, 0, 0)     # At least 4.0
-blender_version_max = (4, 3, 0)     # At most 4.3, optional
+def draw_preferences(layout, context, prefs):
+    pass
 ```
-
-When the version condition is not met:
-
-- The row in the add-on preferences is greyed out with a red explanation.
-- The user cannot enable the tool.
-- The tool does not appear in the N-panel.
-- The console prints `[XNeko] ... refusing to load`.
-
-If these two fields are omitted, the tool is compatible with all versions.
 
 ---
 
-## 6. Lifecycle Hooks
+## 6. Version Compatibility
+
+```python
+blender_version_min = (4, 0, 0)
+blender_version_max = (4, 3, 0)   # optional
+```
+
+When the current Blender version falls outside these bounds:
+
+- the tool is greyed out in the add-on preferences with a red reason
+- the user cannot enable it
+- the tool does not appear in the N-panel
+- the console prints `[XNeko] ... refusing to load`
+
+Omitting both fields means the tool is compatible with all versions.
+
+---
+
+## 7. Lifecycle Hooks
 
 ```python
 _timer_handle = None
 _cache = {}
 
+
 def on_load():
     global _timer_handle
     _timer_handle = bpy.app.timers.register(tick, persistent=True)
+
 
 def on_unload():
     global _timer_handle
@@ -237,11 +253,13 @@ def on_unload():
     _cache.clear()
 ```
 
-**Important:** When a module is disabled, its Python module is removed from `sys.modules`, but timers, handlers, and singletons are not cleaned up automatically. You must release them yourself in `on_unload`.
+When a module is disabled, its Python module is removed from
+`sys.modules`, but timers, handlers and singletons are not cleaned up
+automatically. Release them in `on_unload`.
 
 ---
 
-## 7. Scene Properties
+## 8. Scene Properties
 
 ```python
 from bpy.props import IntProperty
@@ -251,18 +269,19 @@ scene_props = {
 }
 ```
 
-Access them with `context.scene.xneko_my_setting`. It is recommended to use the `xneko_` prefix to avoid conflicts. The framework cleans up these properties automatically when the module is disabled.
+Access them as `context.scene.xneko_my_setting`. Use the `xneko_` prefix
+to avoid conflicts. The framework clears them when the module is disabled.
 
 ---
 
-## 8. Complex Modules (Packages)
+## 9. Complex Modules (Packages)
 
 ```text
 tools/object_tools/advanced_transform/
-├── __init__.py             ← Declares classes / tool_name and other metadata
-├── _operators.py           ← Starts with _ = skipped
-├── _panels.py              ← Skipped
-└── _utils.py               ← Skipped
+├── __init__.py             ← declares classes / tool_name and other metadata
+├── _operators.py           ← starts with _ = skipped
+├── _panels.py              ← skipped
+└── _utils.py               ← skipped
 ```
 
 `__init__.py`:
@@ -281,13 +300,14 @@ classes = (
 )
 ```
 
-**Convention:** When the package itself is a tool, all child files must start with `_`. Otherwise they will be treated as independent tools.
+**Convention** — when the package itself is a tool, all child files must
+start with `_`. Otherwise they are discovered as independent tools.
 
 ---
 
-## 9. Shared Code
+## 10. Shared Code
 
-Code that needs to be reused across modules should be placed under `common/`:
+Reusable code lives under `common/`:
 
 ```text
 common/
@@ -296,28 +316,30 @@ common/
 └── ui_helpers.py
 ```
 
-Import from a module:
+Import from a tool:
 
 ```python
 from ...common import math_helpers
 ```
 
-> **Do not import one tool module from another.** When a module is disabled, it is unloaded, and references will become stale objects.
+> **Do not import one tool module from another.** When a module is
+> disabled it is unloaded, and cross-module references become stale.
 
 ---
 
-## 10. Troubleshooting Checklist
+## 11. Troubleshooting Checklist
 
 | Symptom | Check |
-| --- | --- |
-| Module does not appear | ① Does the file name start with `_`? ② Is there a `classes` tuple? ③ Did the console show `import failed`? ④ Was the version check rejected? |
-| Panel appears at the top level instead of under its group | Check whether `bl_parent_id` / `bl_category` was set manually. |
-| Preference checkbox does not appear | ① Did you use `layout.prop(prefs, ...)`? ② Did you cold restart Blender after changing `preference_props`? |
+| ------- | ----- |
+| Module does not appear | ① file name starts with `_`? ② is there a `classes` tuple? ③ did the console print `import failed`? ④ was the version check rejected? |
+| Panel appears at the top level instead of under its group | Did you set `bl_parent_id` / `bl_category` manually? |
+| Preference widget does not appear | Did you use `layout.prop(prefs, ...)` instead of `prefs.prop(layout, ...)`? |
 | Button should be greyed out but is not | Check the conditions under which `poll` returns `False`. |
-| Code changes do not take effect | **Cold restart Blender** (not F8). |
+| Code changes do not take effect | Cold restart Blender (not F8). |
+| Preset does not affect a tool | Is the tool installed, compatible, and checked in the Apply dialog? |
 
 ---
 
 ## See Also
 
-- [Preset Guide](PRESETS.md) — how to export, import, apply, and share presets, and how project-embedded preferences work.
+- [Preset Guide](PRESETS.md) — how presets and project-embedded preferences work.
