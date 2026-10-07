@@ -3,6 +3,7 @@ import bmesh
 from bpy.props import BoolProperty
 
 
+tool_id = "clean_groups"
 tool_name = "Clean Vertex Groups"
 tool_default_enabled = True
 
