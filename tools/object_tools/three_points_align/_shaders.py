@@ -1,7 +1,4 @@
-# ------------------------------------------------------------
-# GPU shader source strings for the three-points-align overlay.
-# Kept identical to the original addon; no functional changes.
-# ------------------------------------------------------------
+# 1:1 reproduction of the original 3 Points Align shaders module.
 
 
 def color_3d_vertex_shader():
@@ -14,7 +11,7 @@ def color_3d_vertex_shader():
 
         void main()
         {
-            gl_Position = viewProjectionMatrix * vec4(pos, 1.0);;
+            gl_Position = viewProjectionMatrix * vec4(pos, 1.0);
             finalColor = color;
         }
     '''
@@ -41,6 +38,7 @@ def point_fragment_shader():
         {
             vec2 st = gl_PointCoord;
             float dist = distance(vec2(0.5), st);
+            //float delta = fwidth(r);
             float alpha = 1 - smoothstep(0.45, 0.5, dist);
             fragColor = finalColor * alpha;
         }

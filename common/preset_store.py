@@ -1,11 +1,10 @@
 """Preset file management.
 
-Presets are stored inside the addon at:
-    XNeko_Tools/presets/*.json
-
-If the addon folder is read-only (e.g. installed as a Blender
-extension zip), the module silently falls back to the user
-resource directory.
+Write target is always the user resource directory, so user presets
+survive addon updates and reinstalls. The addon-local folder is still
+scanned as a legacy source, so presets written by earlier versions
+remain readable and deletable. New presets are never written into the
+addon folder.
 """
 
 import os
@@ -25,74 +24,130 @@ def _addon_preset_dir():
         return None
 
 
-def _is_writable(folder):
-    """Best-effort check: can we create a file here?"""
-    try:
-        os.makedirs(folder, exist_ok=True)
-        probe = os.path.join(folder, ".write_probe")
-        with open(probe, "w") as f:
-            f.write("")
-        os.remove(probe)
-        return True
-    except OSError:
-        return False
+# The user preset directory is resolved once per session. Repeated
+# calls (list_presets, preset_exists, load_preset, delete_preset)
+# would otherwise trigger makedirs on every redraw.
+_user_preset_dir_cache = None
+
+
+def _user_preset_dir():
+    """Primary preset folder. Always writable, update-safe."""
+    global _user_preset_dir_cache
+    if _user_preset_dir_cache is None:
+        _user_preset_dir_cache = bpy.utils.user_resource(
+            'SCRIPTS',
+            path=os.path.join("presets", "XNeko_Tools"),
+            create=True,
+        )
+    return _user_preset_dir_cache
+
+
+def _all_preset_dirs():
+    """Directories to scan when listing / reading presets.
+
+    User dir first (new location), legacy addon dir second (so existing
+    installs keep working).
+    """
+    dirs = [_user_preset_dir()]
+    addon_dir = _addon_preset_dir()
+    if addon_dir and os.path.isdir(addon_dir):
+        dirs.append(addon_dir)
+    return dirs
 
 
 def get_preset_dir():
-    """Primary preset folder. Prefers the addon-local folder."""
-    addon_dir = _addon_preset_dir()
-    if addon_dir and _is_writable(addon_dir):
-        return addon_dir
-
-    # Fallback: user resource directory (always writable)
-    return bpy.utils.user_resource(
-        'SCRIPTS',
-        path=os.path.join("presets", "XNeko_Tools"),
-        create=True,
-    )
+    """Return the directory used for writing new presets."""
+    return _user_preset_dir()
 
 
 def get_preset_path(name):
-    return os.path.join(get_preset_dir(), name + ".json")
+    """Path used for writing new presets.
+
+    Reads should use _find_preset_path() so legacy presets in the
+    addon folder are still found.
+    """
+    return os.path.join(_user_preset_dir(), name + ".json")
+
+
+def _find_preset_path(name):
+    """Return the first existing path for `name`, or None."""
+    for folder in _all_preset_dirs():
+        candidate = os.path.join(folder, name + ".json")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 # ============================================================
 # Listing
 # ============================================================
 def list_presets():
-    folder = get_preset_dir()
-    if not os.path.isdir(folder):
-        return []
-    names = [fn[:-5] for fn in os.listdir(folder) if fn.endswith(".json")]
+    names = set()
+    for folder in _all_preset_dirs():
+        if not os.path.isdir(folder):
+            continue
+        for fn in os.listdir(folder):
+            if fn.endswith(".json"):
+                names.add(fn[:-5])
     return sorted(names, key=lambda s: s.lower())
 
 
 def preset_exists(name):
-    return os.path.isfile(get_preset_path(name))
+    return _find_preset_path(name) is not None
 
 
 # ============================================================
 # Load / save / delete
 # ============================================================
 def load_preset(name):
-    path = get_preset_path(name)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
+    path = _find_preset_path(name)
+    if path is None:
+        raise FileNotFoundError(name)
     return prefs_io.load_from_file(path)
 
 
 def save_preset(name, data):
     data = dict(data)
     data["name"] = name
+    # Always writes into the user directory.
     prefs_io.save_to_file(get_preset_path(name), data)
 
 
 def delete_preset(name):
-    path = get_preset_path(name)
-    if os.path.isfile(path):
+    # Delete from wherever it actually lives (user or legacy).
+    path = _find_preset_path(name)
+    if path is not None:
         os.remove(path)
 
 
+# ============================================================
+# Name sanitisation
+# ============================================================
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def sanitize_name(name):
+    """Normalise a user-supplied preset name.
+
+    - strips path separators and shell-hostile characters
+    - strips leading/trailing whitespace and trailing dots
+    - prefixes Windows reserved basenames with "_"
+    - truncates overly long names
+    - returns "" for inputs that sanitise to nothing
+    """
+    if not name:
+        return ""
     bad = set('\\/:*?"<>|')
-    return "".join(c for c in name if c not in bad).strip()
+    cleaned = "".join(c for c in name if c not in bad).strip()
+    cleaned = cleaned.rstrip(". ")
+    if not cleaned:
+        return ""
+    if cleaned.upper().split(".", 1)[0] in _WINDOWS_RESERVED:
+        cleaned = "_" + cleaned
+    if len(cleaned) > 120:
+        cleaned = cleaned[:120].rstrip()
+    return cleaned

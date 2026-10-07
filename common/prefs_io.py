@@ -1,15 +1,4 @@
-"""Serialization + project-file sync for XNeko preferences.
-
-A preset records, for each tool:
-
-    __enabled__       bool   whether the tool should be enabled
-    __version_min__   list   Blender version lower bound
-    __version_max__   list   Blender version upper bound
-    preferences       dict   optional, per-tool preference_props values
-
-Preset keys are tool_id strings (e.g. "clean_groups"), not folder paths.
-This keeps presets portable across users and folder renames.
-"""
+"""Serialization + project-file sync for XNeko preferences."""
 
 import os
 import json
@@ -17,7 +6,6 @@ import bpy
 
 
 FORMAT_TAG = "xneko_prefs"
-FORMAT_VERSION = 2
 
 PROJECT_KEY = "xneko_project_prefs"
 
@@ -25,26 +13,13 @@ PROJECT_KEY = "xneko_project_prefs"
 # ============================================================
 # Introspection helpers
 # ============================================================
-def _path_short_id(full_id):
-    """Fallback short id when tool_id is unavailable.
-
-    'XNeko_Tools.tools.mesh_tools.clean_groups' -> 'mesh_tools.clean_groups'
-    """
-    return full_id.split(".tools.", 1)[-1] if ".tools." in full_id else full_id
-
-
 def _short_id(core, full_id):
     """Return the preset key for a registered tool.
 
-    Prefers the tool's explicit tool_id. Falls back to the dotted path
-    if the tool is not in the registry or lacks a tool_id.
+    Delegates to core.get_short_id so the mapping lives in exactly one
+    place across the whole codebase.
     """
-    tool = core._TOOL_REGISTRY.get(full_id)
-    if tool is not None:
-        tid = tool.get("tool_id")
-        if tid:
-            return tid
-    return _path_short_id(full_id)
+    return core.get_short_id(full_id)
 
 
 def _iter_all_tools(core):
@@ -66,11 +41,21 @@ def _blender_version():
 
 
 def _tool_version_bounds(tool):
-    """Read version bounds from the tool's live module.
+    """Return (min, max) version bounds for a tool.
 
-    The bounds are module-level attributes, not fields on the tool dict,
-    so we read them off the module. Returns (None, None) if unavailable.
+    Prefer the bounds cached on the tool record at discovery time.
+    Unloaded tools (module=None) previously exported null bounds and
+    lost compatibility checks. The live-module read is kept as a
+    fallback for external callers.
     """
+    minv = tool.get("version_min")
+    maxv = tool.get("version_max")
+    if minv is not None or maxv is not None:
+        return (
+            list(minv) if minv else None,
+            list(maxv) if maxv else None,
+        )
+
     module = tool.get("module")
     if module is None:
         return None, None
@@ -84,7 +69,6 @@ def _tool_version_bounds(tool):
 
 
 def _set_tool_enabled(core, tool_id, enabled):
-    """Route to core.set_tool_enabled if available, else fall back."""
     fn = getattr(core, "set_tool_enabled", None)
     if callable(fn):
         fn(tool_id, enabled)
@@ -98,11 +82,6 @@ def _set_tool_enabled(core, tool_id, enabled):
 # Preference value collection
 # ============================================================
 def _collect_tool_preferences(prefs_obj, tool):
-    """Return {local_name: value} for a single tool's preference_props.
-
-    Values are restricted to JSON-serializable types. Properties whose
-    values cannot be serialized are skipped silently.
-    """
     names = tool.get("_pref_names") or {}
     if not names:
         return {}
@@ -116,17 +95,11 @@ def _collect_tool_preferences(prefs_obj, tool):
             json.dumps(value)
             out[local_name] = value
         except Exception:
-            # Not JSON-serializable (e.g. PointerProperty). Skip.
             continue
     return out
 
 
 def _apply_tool_preferences(prefs_obj, tool, values):
-    """Write saved preference values back to a tool's pref props.
-
-    Silently skips entries whose target attribute is missing or whose
-    value cannot be assigned.
-    """
     if not values:
         return
 
@@ -151,14 +124,12 @@ def _apply_tool_preferences(prefs_obj, tool, values):
 # Export
 # ============================================================
 def export_prefs(prefs_obj, core, name=""):
-    """Serialize the enabled state and preferences of every tool."""
     enabled_map = {
         it.tool_id: bool(it.enabled) for it in prefs_obj.tool_toggles
     }
 
     data = {
         "format": FORMAT_TAG,
-        "version": FORMAT_VERSION,
         "name": name,
         "plugin_version": _plugin_version(),
         "blender_version": _blender_version(),
@@ -188,7 +159,6 @@ def export_prefs(prefs_obj, core, name=""):
 # Compatibility preview (dry-run)
 # ============================================================
 def _classify(core, data):
-    """Split saved tool entries into applied/skipped for preview."""
     if data.get("format") != FORMAT_TAG:
         raise ValueError("Not an XNeko preferences file")
 
@@ -235,7 +205,6 @@ def _classify(core, data):
 
 
 def preview_compatibility(core, data):
-    """Return (applied_list, skipped_list) without applying anything."""
     return _classify(core, data)
 
 
@@ -243,15 +212,6 @@ def preview_compatibility(core, data):
 # Import (apply)
 # ============================================================
 def import_prefs(prefs_obj, core, data, only_tools=None):
-    """Apply saved state to the given prefs object.
-
-    Applies both enabled state and per-tool preference values.
-
-    only_tools: optional set of short_ids to restrict the application.
-                None applies every compatible entry.
-
-    Returns (applied, skipped) lists of (short_id, info) tuples.
-    """
     applied, skipped = _classify(core, data)
 
     saved_tools = data.get("tools", {})
@@ -277,15 +237,12 @@ def import_prefs(prefs_obj, core, data, only_tools=None):
         saved_entry = saved_tools.get(short, {})
         target = bool(saved_entry.get("__enabled__", True))
 
-        # ---- enabled state ----
         item = toggles.get(full_id)
         if item is not None and item.enabled != target:
-            # Triggers the toggle's update() callback -> core.set_tool_enabled
             item.enabled = target
         else:
             _set_tool_enabled(core, full_id, target)
 
-        # ---- per-tool preference values ----
         values = saved_entry.get("preferences")
         if values:
             tool = core._TOOL_REGISTRY.get(full_id)
