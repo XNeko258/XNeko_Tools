@@ -4,7 +4,7 @@
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 7, 0),
+    "version": (0, 7, 5),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (
@@ -45,7 +45,6 @@ def _unregister_preference_classes():
                 pass
 
 
-#   3. Build XNekoPreferences dynamically (props must be in
 def register():
     # ---- 1. Discovery + issue collection ----
     core._initialize_tools()
