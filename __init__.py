@@ -4,7 +4,7 @@
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 6, 0),
+    "version": (0, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (
@@ -14,6 +14,8 @@ bl_info = {
     "category": "System",
 }
 
+
+import json
 
 import bpy
 
@@ -54,17 +56,19 @@ def _unregister_preference_classes():
 # register()
 # ------------------------------------------------------------
 # Order:
-#   1. Discover tool modules on disk.
+#   1. Discover tool modules on disk + collect registration issues.
 #   2. Register their preference helper PropertyGroups.
 #   3. Build XNekoPreferences dynamically (props must be in
 #      __annotations__ before register_class).
 #   4. Register base classes.
-#   5. Build group panels, then attach tool panels to them.
-#   6. Init toggle list, refresh category, load defaults.
+#   5. Write registration issues + plugin version into prefs.
+#   6. Build group panels, then attach tool panels to them.
+#   7. Init toggle list, refresh category, load defaults.
+#   8. Register preference IO operators and handlers.
 # ============================================================
 def register():
-    # ---- 1. Discovery ----
-    core.discover_tools(__name__, __path__)
+    # ---- 1. Discovery + issue collection ----
+    core._initialize_tools()
 
     # ---- 2. Tool-owned PropertyGroups used by preferences ----
     _register_preference_classes()
@@ -79,16 +83,24 @@ def register():
     preferences.XNekoPreferences = preferences.build_preferences_class()
     bpy.utils.register_class(preferences.XNekoPreferences)
 
-    # ---- 5. Panels ----
+    # ---- 5. Write registration issues + plugin version into prefs ----
+    try:
+        prefs = bpy.context.preferences.addons[__name__].preferences
+        prefs.registration_issues = json.dumps(core._state.registration_issues)
+        prefs.plugin_version = core.get_plugin_version()
+    except Exception as e:
+        print(f"[XNeko] failed to write prefs metadata: {e}")
+
+    # ---- 6. Panels ----
     core.register_group_panels()
     core.attach_panels_to_groups()
 
-    # ---- 6. Toggles + category + defaults ----
+    # ---- 7. Toggles + category + defaults ----
     preferences.init_tool_toggles()
     preferences.refresh_panel_category()
     core.load_default_tools()
 
-    # ---- 7. Preference IO operators ----
+    # ---- 8. Preference IO operators ----
     for name in (
         "XNEKO_OT_export_prefs",
         "XNEKO_OT_import_prefs",
@@ -99,6 +111,8 @@ def register():
         "XNEKO_OT_refresh_presets",
         "XNEKO_OT_apply_project_prefs",
         "XNEKO_OT_clear_project_prefs",
+        "XNEKO_OT_rescan_tools",
+        "XNEKO_OT_open_log_folder",
     ):
         cls = getattr(preferences, name, None)
         if cls is None:
@@ -109,7 +123,7 @@ def register():
         except Exception as e:
             print(f"[XNeko] register {name} failed: {e}")
 
-    # ---- 8. Handlers ----
+    # ---- 9. Handlers ----
     bpy.app.handlers.load_post.append(preferences._on_load_post)
     bpy.app.handlers.save_pre.append(preferences._on_save_pre)
 
@@ -139,6 +153,8 @@ def unregister():
         "XNEKO_OT_confirm_overwrite",
         "XNEKO_OT_import_prefs",
         "XNEKO_OT_export_prefs",
+        "XNEKO_OT_rescan_tools",
+        "XNEKO_OT_open_log_folder",
     ):
         cls = getattr(preferences, name, None)
         if cls is None:
@@ -172,3 +188,6 @@ def unregister():
 
     # ---- 6. Preference helper PropertyGroups ----
     _unregister_preference_classes()
+
+    # ---- 7. Clear plugin state ----
+    core._state.clear()

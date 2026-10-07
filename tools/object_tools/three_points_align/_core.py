@@ -31,8 +31,7 @@ REGISTRATION_MISSING_TOOL_ID = "missing_tool_id"
 REGISTRATION_INVALID_TOOL_ID = "invalid_tool_id"
 REGISTRATION_DUPLICATE_TOOL_ID = "duplicate_tool_id"
 
-# Persistent log file. Stored inside the addon folder by default.
-LOG_DIR_NAME = "logs"
+# Persistent log file.
 LOG_FILE_NAME = "xneko_tools.log"
 LOG_FILE_MAX_BYTES = 1024 * 1024
 
@@ -174,8 +173,8 @@ def set_debug_fallback(enabled):
     _state.debug_fallback = bool(enabled)
 
 
-def _is_debug_enabled():
-    """Return True if registration debug logging is enabled.
+def log_debug(message):
+    """Print a debug message when registration logging is enabled.
 
     Prefers the plugin preference setting. Falls back to the state-level
     flag when preferences are not yet available.
@@ -189,59 +188,25 @@ def _is_debug_enabled():
             )
     except Exception:
         pass
-    return enabled
-
-
-def log_debug(message):
-    """Print a debug message when registration logging is enabled."""
-    if _is_debug_enabled():
+    if enabled:
         print(f"[XNeko_Tools] {message}")
-
-
-def _is_dir_writable(folder):
-    """Best-effort check: can we create a file here?"""
-    try:
-        os.makedirs(folder, exist_ok=True)
-        probe = os.path.join(folder, ".write_probe")
-        with open(probe, "w") as handle:
-            handle.write("")
-        os.remove(probe)
-        return True
-    except OSError:
-        return False
-
-
-def get_log_dir():
-    """Return the directory used for the plugin log file.
-
-    Prefers <addon>/logs. Falls back to the user resource directory
-    when the addon folder is read-only.
-    """
-    addon_dir = os.path.join(os.path.dirname(__file__), LOG_DIR_NAME)
-    if _is_dir_writable(addon_dir):
-        return addon_dir
-
-    return bpy.utils.user_resource(
-        "CONFIG",
-        path=os.path.join("xneko_tools", LOG_DIR_NAME),
-        create=True,
-    )
 
 
 def get_log_file_path():
     """Return the path to the plugin log file."""
-    return os.path.join(get_log_dir(), LOG_FILE_NAME)
+    try:
+        base = bpy.utils.user_resource("CONFIG", path="", create=True)
+    except Exception:
+        base = bpy.app.tempdir
+    return os.path.join(base, LOG_FILE_NAME)
 
 
 def log_to_file(message):
-    """Append a message to the plugin log file.
+    """Append a message to the plugin log file. Never raises.
 
-    Only writes when the debug registration toggle is enabled.
-    Never raises.
+    The log file is truncated when it exceeds LOG_FILE_MAX_BYTES
+    to keep it from growing without bound.
     """
-    if not _is_debug_enabled():
-        return
-
     try:
         path = get_log_file_path()
 
@@ -258,8 +223,7 @@ def log_to_file(message):
 def _report_issue(line):
     """Print a registration issue and append it to the log file.
 
-    Console output is unconditional. The log file is only written
-    when debug logging is enabled.
+    Single write point so console output and log file never diverge.
     """
     print(line)
     log_to_file(line)

@@ -3,8 +3,13 @@ from bpy.props import StringProperty, CollectionProperty, BoolProperty
 from typing import NamedTuple, Optional
 
 
+# ------------------------------------------------------------
+# XNeko Tools metadata
+# ------------------------------------------------------------
+tool_id = "rename_modifiers"
 tool_name = "Rename Modifiers"
 tool_default_enabled = True
+blender_version_min = (4, 0, 0)
 
 
 # ============================================================
@@ -84,21 +89,33 @@ class SelectionInfo(NamedTuple):
 
 
 # ============================================================
-# PropertyGroup
+# PropertyGroup (per-type overrides stored on Scene)
+# ------------------------------------------------------------
+# Every setting here is per-file. Two types support following the
+# attached data (object / vertex group) by default; the checkbox
+# lets the user fall back to a static name for the current project.
 # ============================================================
-class VERIFY_ModPref(bpy.types.PropertyGroup):
+class XNEKO_ModPref(bpy.types.PropertyGroup):
     mod_type: StringProperty()
     custom_name: StringProperty(
         name="Custom Name",
         description=(
-            "Leave empty to use the default rule: Armature/Hook uses "
-            "the target object name, Mask uses the vertex group name, "
-            "others use the default English label"
+            "Optional. When filled, overrides everything else "
+            "(including the follow toggle)"
         ),
     )
     enabled: BoolProperty(
         name="Enabled",
         description="If off, this modifier type is skipped during rename",
+        default=True,
+    )
+    follow_target: BoolProperty(
+        name="Follow Target",
+        description=(
+            "When on, use the attached data name "
+            "(Armature/Hook object, or Mask vertex group). "
+            "When off, fall back to the default label"
+        ),
         default=True,
     )
 
@@ -107,12 +124,13 @@ class VERIFY_ModPref(bpy.types.PropertyGroup):
 # Scan helpers
 # ============================================================
 def scan_selection(context) -> SelectionInfo:
+    objects = list(context.selected_objects)
+
     pairs = []
     types = set()
     has_arm = False
     has_mask = False
     has_hook = False
-    objects = context.selected_objects
 
     for obj in objects:
         mods = getattr(obj, 'modifiers', None)
@@ -123,9 +141,9 @@ def scan_selection(context) -> SelectionInfo:
             types.add(mod.type)
             if not has_arm and mod.type == 'ARMATURE' and mod.object:
                 has_arm = True
-            elif not has_mask and mod.type == 'MASK' and mod.vertex_group:
+            if not has_mask and mod.type == 'MASK' and mod.vertex_group:
                 has_mask = True
-            elif not has_hook and mod.type == 'HOOK' and mod.object:
+            if not has_hook and mod.type == 'HOOK' and mod.object:
                 has_hook = True
 
     return SelectionInfo(
@@ -143,7 +161,6 @@ _VALID_ICONS_CACHE = None
 
 
 def _get_valid_icons():
-    """Cache the set of icon names supported by the current Blender build."""
     global _VALID_ICONS_CACHE
     if _VALID_ICONS_CACHE is None:
         try:
@@ -157,7 +174,6 @@ def _get_valid_icons():
 def safe_icon(mtype: str) -> str:
     icon = MOD_ICONS.get(mtype, 'MODIFIER')
     valid = _get_valid_icons()
-    # If the enum list is unavailable, trust the mapping as-is
     if valid and icon not in valid:
         return 'MODIFIER'
     return icon
@@ -170,7 +186,7 @@ def has_any_modifier(context) -> bool:
     return False
 
 
-def get_pref(prefs, mod_type: str) -> Optional['VERIFY_ModPref']:
+def get_pref(prefs, mod_type: str) -> Optional['XNEKO_ModPref']:
     for p in prefs:
         if p.mod_type == mod_type:
             return p
@@ -181,7 +197,7 @@ def get_pref(prefs, mod_type: str) -> Optional['VERIFY_ModPref']:
 # Pre-population
 # ============================================================
 def ensure_prefs_for_scene(scene) -> None:
-    prefs = getattr(scene, 'verify_mod_prefs', None)
+    prefs = getattr(scene, 'xneko_mod_prefs', None)
     if prefs is None:
         return
     existing = {p.mod_type for p in prefs}
@@ -189,15 +205,6 @@ def ensure_prefs_for_scene(scene) -> None:
         if mtype not in existing:
             p = prefs.add()
             p.mod_type = mtype
-
-
-def _prepopulate_timer():
-    try:
-        for scene in bpy.data.scenes:
-            ensure_prefs_for_scene(scene)
-    except Exception as e:
-        print(f"[XNeko] prepopulate failed: {e}")
-    return None
 
 
 @bpy.app.handlers.persistent
@@ -211,48 +218,59 @@ def _on_load_post(_dummy):
 
 # ============================================================
 # Core renaming logic
+# ------------------------------------------------------------
+# Name resolution order:
+#   1. custom_name          -- overrides everything when filled
+#   2. follow_target on     -- use the attached data name
+#   3. default label        -- fallback
 # ============================================================
-def rename_mods(pairs, prefs, *, use_armature: bool,
-                use_group: bool, use_hook: bool) -> int:
-    count = 0
+def _compute_name(mod, pref):
+    custom = (pref.custom_name.strip() if pref and pref.custom_name else "")
+    if custom:
+        return custom
+
+    follow = bool(pref.follow_target) if pref else True
+
+    if follow:
+        if mod.type == 'ARMATURE' and mod.object:
+            return mod.object.name
+        if mod.type == 'HOOK' and mod.object:
+            return mod.object.name
+        if mod.type == 'MASK' and mod.vertex_group:
+            return mod.vertex_group
+
+    return DEFAULT_MOD_NAMES.get(mod.type, mod.type.title())
+
+
+def rename_mods(pairs, prefs):
+    """Rename every modifier in `pairs`.
+
+    Returns (processed, collisions). Collisions are cases where
+    Blender had to append a numeric suffix because the target name
+    was already taken on the same object.
+    """
+    processed = 0
+    collisions = 0
+
     for _obj, mod in pairs:
         pref = get_pref(prefs, mod.type)
         if pref is not None and not pref.enabled:
             continue
 
-        custom = (pref.custom_name.strip() if pref and pref.custom_name else "")
+        target = _compute_name(mod, pref)
+        mod.name = target
+        processed += 1
 
-        if mod.type == 'ARMATURE':
-            if use_armature and mod.object:
-                mod.name = mod.object.name
-            else:
-                mod.name = custom or "Armature"
+        if mod.name != target:
+            collisions += 1
 
-        elif mod.type == 'HOOK':
-            if use_hook and mod.object:
-                mod.name = mod.object.name
-            else:
-                mod.name = custom or "Hook"
-
-        elif mod.type == 'MASK':
-            if use_group and mod.vertex_group:
-                mod.name = mod.vertex_group
-            else:
-                mod.name = custom or "Mask"
-
-        else:
-            mod.name = custom or DEFAULT_MOD_NAMES.get(
-                mod.type, mod.type.title()
-            )
-
-        count += 1
-    return count
+    return processed, collisions
 
 
 # ============================================================
-# Panel drawing helpers
+# Panel drawing helper
 # ============================================================
-def draw_modifier_row(layout, scene, entry, mtype: str, info: SelectionInfo):
+def draw_modifier_row(layout, entry, mtype, info):
     default = DEFAULT_MOD_NAMES.get(mtype, mtype.title())
     icon_name = safe_icon(mtype)
     row = layout.row(align=True)
@@ -263,40 +281,32 @@ def draw_modifier_row(layout, scene, entry, mtype: str, info: SelectionInfo):
     right = row.row(align=True)
     right.enabled = entry.enabled
 
+    # Follow checkbox is meaningful only for the three target-based types
     if mtype == 'ARMATURE':
-        use_obj = scene.verify_armature_use_object
-        has_target = info.has_armature_target
-
         cb = right.row(align=True)
-        cb.enabled = has_target
-        cb.prop(scene, "verify_armature_use_object", text="Follow Armature")
+        cb.enabled = info.has_armature_target
+        cb.prop(entry, "follow_target", text="Follow Armature")
 
         inp = right.row(align=True)
-        inp.enabled = not (use_obj and has_target)
+        inp.enabled = not (entry.follow_target and info.has_armature_target)
         inp.prop(entry, "custom_name", text="", icon='SORTALPHA')
 
     elif mtype == 'HOOK':
-        use_hook = scene.verify_hook_use_object
-        has_target = info.has_hook_target
-
         cb = right.row(align=True)
-        cb.enabled = has_target
-        cb.prop(scene, "verify_hook_use_object", text="Follow Object")
+        cb.enabled = info.has_hook_target
+        cb.prop(entry, "follow_target", text="Follow Object")
 
         inp = right.row(align=True)
-        inp.enabled = not (use_hook and has_target)
+        inp.enabled = not (entry.follow_target and info.has_hook_target)
         inp.prop(entry, "custom_name", text="", icon='SORTALPHA')
 
     elif mtype == 'MASK':
-        use_grp = scene.verify_mask_use_group
-        has_target = info.has_mask_target
-
         cb = right.row(align=True)
-        cb.enabled = has_target
-        cb.prop(scene, "verify_mask_use_group", text="Follow VGroup")
+        cb.enabled = info.has_mask_target
+        cb.prop(entry, "follow_target", text="Follow VGroup")
 
         inp = right.row(align=True)
-        inp.enabled = not (use_grp and has_target)
+        inp.enabled = not (entry.follow_target and info.has_mask_target)
         inp.prop(entry, "custom_name", text="", icon='SORTALPHA')
 
     else:
@@ -306,8 +316,8 @@ def draw_modifier_row(layout, scene, entry, mtype: str, info: SelectionInfo):
 # ============================================================
 # Operators
 # ============================================================
-class VERIFY_OT_rename_modifiers(bpy.types.Operator):
-    bl_idname = "xneko.verify_rename_modifiers"
+class XNEKO_OT_rename_modifiers(bpy.types.Operator):
+    bl_idname = "xneko.rename_modifiers"
     bl_label = "Rename Modifiers"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -316,15 +326,15 @@ class VERIFY_OT_rename_modifiers(bpy.types.Operator):
         return has_any_modifier(context)
 
     def invoke(self, context, event):
-        if context.scene.verify_show_warning:
+        scene = context.scene
+        if getattr(scene, "xneko_mod_show_warning", True):
             return context.window_manager.invoke_props_dialog(self, width=400)
         return self.execute(context)
 
     def draw(self, context):
         info = scan_selection(context)
         col = self.layout.column()
-        col.label(text="Rename modifiers on all selected objects?",
-                  icon='QUESTION')
+        col.label(text="Rename modifiers?", icon='QUESTION')
         col.separator()
         col.label(
             text=f"Will process {info.total_mods} modifier(s) "
@@ -332,29 +342,33 @@ class VERIFY_OT_rename_modifiers(bpy.types.Operator):
         )
         col.separator()
         col.label(text="· Existing modifier names will be overwritten")
-        col.label(text="· Cannot be undone after saving the file")
+        col.label(text="· Duplicate targets get '.001' suffixes")
         col.label(text="· Ctrl+Z works within this session")
 
     def execute(self, context):
         scene = context.scene
         ensure_prefs_for_scene(scene)
         info = scan_selection(context)
-        n = rename_mods(
-            info.pairs,
-            scene.verify_mod_prefs,
-            use_armature=scene.verify_armature_use_object,
-            use_group=scene.verify_mask_use_group,
-            use_hook=scene.verify_hook_use_object,
-        )
+
+        n, collisions = rename_mods(info.pairs, scene.xneko_mod_prefs)
+
         if n == 0:
             self.report({'WARNING'}, "No entries are enabled")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Done. Processed {n} modifier(s)")
+
+        if collisions:
+            self.report(
+                {'INFO'},
+                f"Renamed {n} modifier(s); "
+                f"{collisions} name collision(s) got .001 suffixes",
+            )
+        else:
+            self.report({'INFO'}, f"Renamed {n} modifier(s)")
         return {'FINISHED'}
 
 
-class VERIFY_OT_toggle_all_enabled(bpy.types.Operator):
-    bl_idname = "xneko.verify_toggle_all_enabled"
+class XNEKO_OT_toggle_all_enabled(bpy.types.Operator):
+    bl_idname = "xneko.rename_modifiers_toggle_all"
     bl_label = "Toggle All Enabled"
     bl_description = "Toggle the enabled state of all visible entries"
 
@@ -362,7 +376,7 @@ class VERIFY_OT_toggle_all_enabled(bpy.types.Operator):
         scene = context.scene
         ensure_prefs_for_scene(scene)
         info = scan_selection(context)
-        prefs = scene.verify_mod_prefs
+        prefs = scene.xneko_mod_prefs
 
         visible = [p for p in prefs if p.mod_type in info.types_in_use]
         if not visible:
@@ -378,44 +392,66 @@ class VERIFY_OT_toggle_all_enabled(bpy.types.Operator):
 # ============================================================
 # Panel
 # ============================================================
-class VIEW3D_PT_xneko_verify_rename(bpy.types.Panel):
+class VIEW3D_PT_xneko_rename_modifiers(bpy.types.Panel):
     bl_label = "Rename Modifiers"
-    bl_idname = "VIEW3D_PT_xneko_verify_rename"
+    bl_idname = "VIEW3D_PT_xneko_rename_modifiers"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
 
-    @classmethod
-    def poll(cls, context):
-        return has_any_modifier(context)
+    # No poll -> the panel header is always visible.
 
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        mod_prefs = scene.verify_mod_prefs
+
+        selected = context.selected_objects
+        active_obj = context.object
+
+        # Case 1: nothing selected at all
+        if not selected and active_obj is None:
+            box = layout.box()
+            box.label(text="No object selected", icon='INFO')
+            return
+
+        # Case 2: selection has no modifiers
+        if not has_any_modifier(context):
+            box = layout.box()
+            box.label(text="No modifiers in target", icon='INFO')
+            return
+
+        # Case 3: normal
+        ensure_prefs_for_scene(scene)
+
+        mod_prefs = scene.xneko_mod_prefs
         info = scan_selection(context)
 
         layout.label(
             text=f"Selected {info.object_count} object(s) / "
                  f"{info.total_mods} modifier(s)"
         )
+
+        hint = layout.row()
+        hint.enabled = False
+        hint.label(text="Settings below are stored in this .blend", icon='INFO')
+
         layout.separator()
 
         for mtype in sorted(info.types_in_use):
             entry = get_pref(mod_prefs, mtype)
             if entry is None:
                 continue
-            draw_modifier_row(layout, scene, entry, mtype, info)
+            draw_modifier_row(layout, entry, mtype, info)
 
         layout.separator()
 
         row = layout.row(align=True)
-        row.operator("xneko.verify_rename_modifiers", icon='MODIFIER')
-        row.prop(scene, "verify_show_warning", text="Confirm")
+        row.operator("xneko.rename_modifiers", icon='MODIFIER')
+        row.prop(scene, "xneko_mod_show_warning", text="Confirm")
 
         visible = [p for p in mod_prefs if p.mod_type in info.types_in_use]
         all_on = all(p.enabled for p in visible) if visible else True
         layout.operator(
-            "xneko.verify_toggle_all_enabled",
+            "xneko.rename_modifiers_toggle_all",
             text="Disable All" if all_on else "Enable All",
             icon='CHECKBOX_HLT' if all_on else 'CHECKBOX_DEHLT',
         )
@@ -425,59 +461,36 @@ class VIEW3D_PT_xneko_verify_rename(bpy.types.Panel):
 # Registration declarations (consumed by core.py)
 # ============================================================
 classes = (
-    VERIFY_ModPref,
-    VERIFY_OT_rename_modifiers,
-    VERIFY_OT_toggle_all_enabled,
-    VIEW3D_PT_xneko_verify_rename,
+    XNEKO_ModPref,
+    XNEKO_OT_rename_modifiers,
+    XNEKO_OT_toggle_all_enabled,
+    VIEW3D_PT_xneko_rename_modifiers,
 )
 
 scene_props = {
-    "verify_mod_prefs": CollectionProperty(type=VERIFY_ModPref),
-    "verify_armature_use_object": BoolProperty(
-        name="Follow Armature",
+    "xneko_mod_prefs": CollectionProperty(type=XNEKO_ModPref),
+    "xneko_mod_show_warning": BoolProperty(
+        name="Show Confirmation",
         description=(
-            "When on, modifier name matches the armature object name; "
-            "falls back to 'Armature' if nothing is assigned"
+            "Show a confirmation dialog before renaming. "
+            "Turn off to rename immediately"
         ),
-        default=True,
-    ),
-    "verify_hook_use_object": BoolProperty(
-        name="Follow Object",
-        description=(
-            "When on, modifier name matches the Hook target object name; "
-            "falls back to 'Hook' if nothing is assigned"
-        ),
-        default=True,
-    ),
-    "verify_mask_use_group": BoolProperty(
-        name="Follow VGroup",
-        description=(
-            "When on, modifier name matches the vertex group name; "
-            "falls back to 'Mask' if nothing is assigned"
-        ),
-        default=True,
-    ),
-    "verify_show_warning": BoolProperty(
-        name="Confirm",
-        description="Show a confirmation dialog when renaming",
         default=True,
     ),
 }
 
 
+# ============================================================
+# Lifecycle
+# ============================================================
 def on_load():
-    """Register the timer and load handler when the tool is enabled."""
-    if not bpy.app.timers.is_registered(_prepopulate_timer):
-        bpy.app.timers.register(_prepopulate_timer, first_interval=0.1)
+    global _VALID_ICONS_CACHE
+    _VALID_ICONS_CACHE = None
 
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
 
 
 def on_unload():
-    """Remove the timer and load handler when the tool is disabled."""
-    if bpy.app.timers.is_registered(_prepopulate_timer):
-        bpy.app.timers.unregister(_prepopulate_timer)
-
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)

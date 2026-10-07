@@ -2,16 +2,25 @@ import bpy
 from mathutils import Vector
 
 
+# ------------------------------------------------------------
+# XNeko Tools metadata
+# ------------------------------------------------------------
+tool_id = "vertex_group_to_bones"
 tool_name = "Vertex Group to Bones"
 tool_default_enabled = True
+blender_version_min = (4, 0, 0)
 
 
-# ---------------- Constants ----------------
+# ============================================================
+# Constants
+# ============================================================
 DIRECTION_MIN_WEIGHT = 1e-6
 
 
-# ---------------- Data storage ----------------
-class VGB_GroupItem(bpy.types.PropertyGroup):
+# ============================================================
+# Data storage
+# ============================================================
+class XNEKO_VGBGroupItem(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
     selected: bpy.props.BoolProperty(default=False)
 
@@ -20,20 +29,33 @@ def _armature_poll(self, obj):
     return obj is not None and obj.type == 'ARMATURE'
 
 
-class VGB_Properties(bpy.types.PropertyGroup):
+class XNEKO_VGBProperties(bpy.types.PropertyGroup):
     armature: bpy.props.PointerProperty(
         name="Target Armature",
+        description=(
+            "Armature to receive the generated bones. "
+            "Leave empty to create a new one"
+        ),
         type=bpy.types.Object,
         poll=_armature_poll,
     )
     threshold: bpy.props.FloatProperty(
-        name="Head Threshold", default=0.5, min=0.0, max=1.0, subtype='FACTOR',
+        name="Head Threshold",
+        description=(
+            "Only vertices above this weight contribute to the "
+            "computed head position"
+        ),
+        default=0.5, min=0.0, max=1.0, subtype='FACTOR',
     )
     bone_length: bpy.props.FloatProperty(
-        name="Bone Length", default=0.1, min=0.001,
+        name="Bone Length",
+        description="Length of every generated bone",
+        default=0.1, min=0.001,
     )
     collection_name: bpy.props.StringProperty(
-        name="New Collection", default="GeneratedBones",
+        name="New Collection",
+        description="Collection that receives the auto-created armature",
+        default="GeneratedBones",
     )
     show_in_front: bpy.props.BoolProperty(
         name="Show In Front",
@@ -42,12 +64,14 @@ class VGB_Properties(bpy.types.PropertyGroup):
     )
 
     target_object: bpy.props.StringProperty(default="")
-    groups: bpy.props.CollectionProperty(type=VGB_GroupItem)
+    groups: bpy.props.CollectionProperty(type=XNEKO_VGBGroupItem)
     active_group_index: bpy.props.IntProperty(default=0)
 
 
-# ---------------- Sync vertex group list ----------------
-def sync_vertex_groups(obj, props):
+# ============================================================
+# Sync vertex group list
+# ============================================================
+def _sync_vertex_groups(obj, props):
     current_names = [vg.name for vg in obj.vertex_groups]
 
     # Target object changed -> reset
@@ -74,18 +98,22 @@ def sync_vertex_groups(obj, props):
             props.active_group_index, len(props.groups) - 1
         )
 
-    print(f"[XNeko] Vertex groups synced: {current_names}")
 
-
-# ---------------- Depsgraph handler ----------------
+# ============================================================
+# Depsgraph handler
+# ------------------------------------------------------------
+# Guard prevents the handler from re-entering itself while it
+# mutates the props collection (which would trigger another
+# depsgraph update in some Blender builds).
+# ============================================================
 _sync_guard = {"busy": False}
 
 
-def _vgb_depsgraph_handler(scene, *args):
+def _xneko_vgb_depsgraph_handler(scene, *args):
     if _sync_guard["busy"]:
         return
 
-    props = getattr(scene, "vgb_props", None)
+    props = getattr(scene, "xneko_vgb_props", None)
     if props is None:
         return
 
@@ -100,17 +128,25 @@ def _vgb_depsgraph_handler(scene, *args):
 
     _sync_guard["busy"] = True
     try:
-        sync_vertex_groups(obj, props)
+        _sync_vertex_groups(obj, props)
     except Exception as e:
-        print(f"[XNeko] sync error: {e}")
+        print(f"[XNeko] vgb sync error: {e}")
     finally:
         _sync_guard["busy"] = False
 
 
-# ---------------- Operators ----------------
-class VGB_OT_generate(bpy.types.Operator):
+# ============================================================
+# Operators
+# ============================================================
+class XNEKO_OT_vgb_generate(bpy.types.Operator):
     bl_idname = "xneko.vgb_generate"
     bl_label = "Generate Bones"
+    bl_description = (
+        "Create one bone per selected vertex group. "
+        "Head position is the weighted centroid of vertices above "
+        "the threshold; tail direction points toward the lowest-"
+        "weight vertex"
+    )
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -118,11 +154,13 @@ class VGB_OT_generate(bpy.types.Operator):
         obj = context.active_object
         if obj is None or obj.type != 'MESH':
             return False
-        props = context.scene.vgb_props
+        props = getattr(context.scene, "xneko_vgb_props", None)
+        if props is None:
+            return False
         return any(item.selected for item in props.groups)
 
     def execute(self, context):
-        props = context.scene.vgb_props
+        props = context.scene.xneko_vgb_props
         obj = context.active_object
         if obj is None or obj.type != 'MESH':
             self.report({'ERROR'}, "Please select a mesh object first")
@@ -139,7 +177,7 @@ class VGB_OT_generate(bpy.types.Operator):
         if context.object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # ---- Target armature ----
+        # ---------- Target armature ----------
         arm_obj = props.armature
         newly_created = False
 
@@ -150,7 +188,8 @@ class VGB_OT_generate(bpy.types.Operator):
                 coll = bpy.data.collections.new(col_name)
                 context.scene.collection.children.link(coll)
             else:
-                if coll.name not in [c.name for c in context.scene.collection.children]:
+                if coll.name not in [c.name
+                                     for c in context.scene.collection.children]:
                     context.scene.collection.children.link(coll)
 
             arm_data = bpy.data.armatures.new(obj.name + "_Armature")
@@ -163,7 +202,7 @@ class VGB_OT_generate(bpy.types.Operator):
         arm_data = arm_obj.data
         arm_obj.show_in_front = props.show_in_front
 
-        # ---- Enter Edit mode ----
+        # ---------- Enter Edit mode ----------
         bpy.ops.object.select_all(action='DESELECT')
         arm_obj.select_set(True)
         context.view_layer.objects.active = arm_obj
@@ -180,7 +219,9 @@ class VGB_OT_generate(bpy.types.Operator):
                 world_pos = obj.matrix_world @ v.co
                 for g in v.groups:
                     if g.weight > 0.0 and g.group in group_members:
-                        group_members[g.group].append((g.weight, world_pos.copy()))
+                        group_members[g.group].append(
+                            (g.weight, world_pos.copy())
+                        )
 
             for vg in obj.vertex_groups:
                 if vg.name not in selected_names:
@@ -204,7 +245,7 @@ class VGB_OT_generate(bpy.types.Operator):
                 else:
                     head_world = sum(
                         (p * w for w, p in high),
-                        Vector((0.0, 0.0, 0.0))
+                        Vector((0.0, 0.0, 0.0)),
                     ) / total_w
 
                 direction_candidates = [
@@ -232,16 +273,20 @@ class VGB_OT_generate(bpy.types.Operator):
             bpy.ops.object.mode_set(mode='OBJECT')
 
         msg = f"Generated {created} bone(s)"
-        msg += f" -> created '{arm_obj.name}'" if newly_created else f" -> appended to '{arm_obj.name}'"
+        if newly_created:
+            msg += f" -> created '{arm_obj.name}'"
+        else:
+            msg += f" -> appended to '{arm_obj.name}'"
         if skipped:
             msg += f" (skipped {skipped} duplicate(s))"
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
-class VGB_OT_select_all(bpy.types.Operator):
+class XNEKO_OT_vgb_select(bpy.types.Operator):
     bl_idname = "xneko.vgb_select"
     bl_label = "Selection Action"
+    bl_options = {'INTERNAL'}
 
     action: bpy.props.EnumProperty(items=[
         ('SELECT', 'Select', ''),
@@ -250,7 +295,7 @@ class VGB_OT_select_all(bpy.types.Operator):
     ])
 
     def execute(self, context):
-        props = context.scene.vgb_props
+        props = context.scene.xneko_vgb_props
         for item in props.groups:
             if self.action == 'SELECT':
                 item.selected = True
@@ -261,18 +306,20 @@ class VGB_OT_select_all(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class VGB_OT_clear_armature(bpy.types.Operator):
+class XNEKO_OT_vgb_clear_armature(bpy.types.Operator):
     bl_idname = "xneko.vgb_clear_armature"
     bl_label = "Clear Target Armature"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        context.scene.vgb_props.armature = None
+        context.scene.xneko_vgb_props.armature = None
         return {'FINISHED'}
 
 
-# ---------------- UI List ----------------
-class VGB_UL_groups(bpy.types.UIList):
+# ============================================================
+# UI List
+# ============================================================
+class XNEKO_UL_vgb_groups(bpy.types.UIList):
     def draw_item(self, context, layout, data, item,
                   icon, active_data, active_propname, index):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
@@ -284,25 +331,42 @@ class VGB_UL_groups(bpy.types.UIList):
             layout.prop(item, "selected", text="")
 
 
-# ---------------- Panel ----------------
-class VGB_PT_panel(bpy.types.Panel):
+# ============================================================
+# Panel
+# ============================================================
+class VIEW3D_PT_xneko_vgb(bpy.types.Panel):
     bl_label = "Vertex Group to Bones"
     bl_idname = "VIEW3D_PT_xneko_vgb"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    # bl_category is set automatically by core
+
+    # No poll -> the panel header is always visible.
 
     def draw(self, context):
         layout = self.layout
         obj = context.active_object
 
-        if obj is None or obj.type != 'MESH':
+        # Case 1: no object selected at all
+        if obj is None:
             box = layout.box()
-            box.label(text="Select a mesh object", icon='ERROR')
+            box.label(text="Select a mesh object", icon='INFO')
             return
 
-        props = context.scene.vgb_props
+        # Case 2: not a mesh
+        if obj.type != 'MESH':
+            box = layout.box()
+            box.label(text="Not a mesh object", icon='INFO')
+            return
 
+        props = context.scene.xneko_vgb_props
+
+        # Case 3: mesh without vertex groups
+        if len(obj.vertex_groups) == 0:
+            box = layout.box()
+            box.label(text="This mesh has no vertex groups", icon='INFO')
+            return
+
+        # Case 4: normal
         # ---------- Target armature ----------
         box = layout.box()
         box.label(text="Target Armature", icon='ARMATURE_DATA')
@@ -317,8 +381,10 @@ class VGB_PT_panel(bpy.types.Panel):
             box.label(text="Empty -> Create new armature", icon='INFO')
             box.prop(props, "collection_name")
         else:
-            box.label(text=f"Bones will be appended to: {props.armature.name}",
-                      icon='CHECKMARK')
+            box.label(
+                text=f"Bones will be appended to: {props.armature.name}",
+                icon='CHECKMARK',
+            )
 
         layout.separator()
 
@@ -332,7 +398,8 @@ class VGB_PT_panel(bpy.types.Panel):
 
         # ---------- Vertex group list ----------
         box = layout.box()
-        box.label(text="Vertex Groups (check to generate)", icon='GROUP_VERTEX')
+        box.label(text="Vertex Groups (check to generate)",
+                  icon='GROUP_VERTEX')
 
         if len(props.groups) == 0:
             box.label(text="(No vertex groups)", icon='INFO')
@@ -341,7 +408,7 @@ class VGB_PT_panel(bpy.types.Panel):
             box.label(text=f"{checked} / {len(props.groups)} selected")
 
             box.template_list(
-                "VGB_UL_groups", "vgb_groups",
+                "XNEKO_UL_vgb_groups", "xneko_vgb_groups",
                 props, "groups",
                 props, "active_group_index",
                 rows=6,
@@ -363,31 +430,40 @@ class VGB_PT_panel(bpy.types.Panel):
             layout.label(text="Select at least one vertex group", icon='INFO')
 
 
-# ---------------- Registration declarations ----------------
+# ============================================================
+# Registration declarations (consumed by core.py)
+# ============================================================
 classes = (
-    VGB_GroupItem,
-    VGB_Properties,
-    VGB_UL_groups,
-    VGB_OT_generate,
-    VGB_OT_select_all,
-    VGB_OT_clear_armature,
-    VGB_PT_panel,
+    XNEKO_VGBGroupItem,
+    XNEKO_VGBProperties,
+    XNEKO_UL_vgb_groups,
+    XNEKO_OT_vgb_generate,
+    XNEKO_OT_vgb_select,
+    XNEKO_OT_vgb_clear_armature,
+    VIEW3D_PT_xneko_vgb,
 )
 
 scene_props = {
-    "vgb_props": bpy.props.PointerProperty(type=VGB_Properties),
+    "xneko_vgb_props": bpy.props.PointerProperty(type=XNEKO_VGBProperties),
 }
 
 
+# ============================================================
+# Lifecycle
+# ============================================================
 def on_load():
     """Attach the depsgraph handler when the tool is enabled."""
-    if _vgb_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(_vgb_depsgraph_handler)
+    if _xneko_vgb_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(
+            _xneko_vgb_depsgraph_handler
+        )
 
 
 def on_unload():
     """Detach the depsgraph handler when the tool is disabled."""
     try:
-        bpy.app.handlers.depsgraph_update_post.remove(_vgb_depsgraph_handler)
+        bpy.app.handlers.depsgraph_update_post.remove(
+            _xneko_vgb_depsgraph_handler
+        )
     except Exception:
         pass
