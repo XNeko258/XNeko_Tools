@@ -23,13 +23,6 @@ from . import core
 from . import preferences
 
 
-# ============================================================
-# Preference-class helpers
-# ------------------------------------------------------------
-# Tools may declare `preference_classes` — PropertyGroups that
-# must be registered *before* XNekoPreferences, because some
-# preference_props may be PointerProperty targeting them.
-# ============================================================
 def _register_preference_classes():
     for tool in core._TOOL_REGISTRY.values():
         for cls in tool.get("preference_classes", ()):
@@ -52,20 +45,7 @@ def _unregister_preference_classes():
                 pass
 
 
-# ============================================================
-# register()
-# ------------------------------------------------------------
-# Order:
-#   1. Discover tool modules on disk + collect registration issues.
-#   2. Register their preference helper PropertyGroups.
 #   3. Build XNekoPreferences dynamically (props must be in
-#      __annotations__ before register_class).
-#   4. Register base classes.
-#   5. Write registration issues + plugin version into prefs.
-#   6. Build group panels, then attach tool panels to them.
-#   7. Init toggle list, refresh category, load defaults.
-#   8. Register preference IO operators and handlers.
-# ============================================================
 def register():
     # ---- 1. Discovery + issue collection ----
     core._initialize_tools()
@@ -100,6 +80,11 @@ def register():
     preferences.refresh_panel_category()
     core.load_default_tools()
 
+    # ---- 7b. Restore last session state, if any ----
+    # Overrides the defaults that were just applied, so the user's
+    # last-known tool enable flags survive Blender restarts.
+    preferences.apply_session_if_any()
+
     # ---- 8. Preference IO operators ----
     for name in (
         "XNEKO_OT_export_prefs",
@@ -128,9 +113,6 @@ def register():
     bpy.app.handlers.save_pre.append(preferences._on_save_pre)
 
 
-# ============================================================
-# unregister()
-# ============================================================
 def unregister():
     # ---- 0. Handlers first ----
     try:

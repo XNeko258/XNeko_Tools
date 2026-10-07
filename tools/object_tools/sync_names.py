@@ -6,7 +6,7 @@ import bpy
 # ------------------------------------------------------------
 tool_id = "sync_names"
 tool_name = "Sync Data Names"
-tool_default_enabled = False
+tool_default_enabled = True
 blender_version_min = (4, 0, 0)
 
 

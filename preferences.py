@@ -8,7 +8,7 @@ from bpy.props import (
 from bpy_extras.io_utils import ImportHelper
 
 from . import core
-from .common import prefs_io, preset_store
+from .common import prefs_io, preset_store, session_store
 
 
 # ---------------- Link configuration ----------------
@@ -23,10 +23,6 @@ LINKS = (
 
 # ==================================================
 # Preset list cache
-# --------------------------------------------------
-# list_presets() touches the file system. The preferences panel
-# redraws on every mouse move, so we cache the result and only
-# refresh it explicitly (button click, export, import, delete).
 # ==================================================
 _preset_cache = None
 
@@ -54,12 +50,59 @@ _ACTIVE_APPLY_OP = None
 
 
 # ==================================================
+# Session persistence
+# --------------------------------------------------
+# Tool enable flags and per-tool preference values are written to a
+# session file whenever they change, and restored on plugin register.
+# This makes the state survive Blender restarts without relying on
+# the user explicitly saving preferences.
+# ==================================================
+_suppress_session_write = False
+
+
+def _write_session():
+    """Persist current tool states + tool prefs to the session file."""
+    if _suppress_session_write:
+        return
+    prefs = bpy.context.preferences.addons.get(__package__)
+    if not prefs:
+        return
+    try:
+        data = prefs_io.export_prefs(
+            prefs.preferences, core, name="__session__",
+        )
+    except Exception as e:
+        print(f"[XNeko] failed to build session data: {e}")
+        return
+    session_store.save_session(data)
+
+
+def apply_session_if_any():
+    """Restore tool states from the session file, if it exists.
+
+    Called at register time after init_tool_toggles() and
+    load_default_tools(), and again on load_post when the loaded
+    .blend carries no project preferences.
+    """
+    global _suppress_session_write
+    data = session_store.load_session()
+    if data is None:
+        return
+    prefs = bpy.context.preferences.addons.get(__package__)
+    if not prefs:
+        return
+    _suppress_session_write = True
+    try:
+        prefs_io.import_prefs(prefs.preferences, core, data)
+    except Exception as e:
+        print(f"[XNeko] failed to apply session: {e}")
+    finally:
+        _suppress_session_write = False
+
+
+# ==================================================
 # Helpers
 # ==================================================
-def _sanitize(name):
-    return "".join(c if c.isalnum() else "_" for c in name)
-
-
 def _make_pref_prefix(tool_id):
     """Build a compact, unique prefix for a tool's preference props.
 
@@ -76,23 +119,10 @@ def _make_pref_prefix(tool_id):
     return f"t_{h}_"
 
 
-def _short_id(full_id):
-    """Return the tool_id for a registered tool, or a path-based fallback.
-
-    Preset keys are the tool_id, so moving a tool between groups,
-    renaming its file, or sharing presets across users all keep working
-    as long as the tool_id stays the same.
-    """
-    tool = core._TOOL_REGISTRY.get(full_id)
-    if tool is not None:
-        return tool.get("tool_id", full_id)
-    return full_id.split(".tools.", 1)[-1] if ".tools." in full_id else full_id
-
-
 def _full_id_map():
     """Return {tool_id: full_id} for every registered tool."""
     return {
-        tool.get("tool_id", fid): fid
+        tool["tool_id"]: fid
         for fid, tool in core._TOOL_REGISTRY.items()
     }
 
@@ -113,17 +143,7 @@ def _redraw_view3d(context=None):
 
 
 class _ToolPrefNamespace:
-    """Thin wrapper giving tools an ergonomic view of their prefs.
-
-    Usage inside a tool module:
-
-        def draw_preferences(layout, context, prefs):
-            prefs.prop(layout, "prefix")
-            prefs.prop(layout, "auto_number")
-
-        value = prefs.prefix          # read
-        prefs.prefix = "Bone_"        # write
-    """
+    """Thin wrapper giving tools an ergonomic view of their prefs."""
 
     def __init__(self, obj, names):
         d = self.__dict__
@@ -197,7 +217,7 @@ def _get_usable_width(context):
 
 def _estimate_tab_px(display_text):
     scale = _get_ui_scale()
-    return int((len(display_text) * 7 + 22 + 16) * scale)
+    return int((len(display_text) * 8 + 38) * scale)
 
 
 # ==================================================
@@ -241,7 +261,7 @@ class XNEKO_OT_shift_tab_page(bpy.types.Operator):
 # Per-tool toggle
 # ==================================================
 class XNekoToolToggle(bpy.types.PropertyGroup):
-    tool_id: StringProperty()          # full module name (registry key)
+    tool_id: StringProperty()
     display_name: StringProperty()
     enabled: BoolProperty(
         default=True,
@@ -254,8 +274,8 @@ class XNekoToolToggle(bpy.types.PropertyGroup):
 # One row in the Apply Preset dialog
 # ==================================================
 class XNEKO_ApplyPresetEntry(bpy.types.PropertyGroup):
-    tool_id: StringProperty()          # full module name
-    short_id: StringProperty()         # tool_id (JSON key)
+    tool_id: StringProperty()
+    short_id: StringProperty()
     display_name: StringProperty()
     detail: StringProperty()
     selected: BoolProperty(default=True)
@@ -419,13 +439,16 @@ class XNEKO_OT_apply_preset(bpy.types.Operator):
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
+        if data.get("format") != prefs_io.FORMAT_TAG:
+            self.report({'ERROR'}, "Not an XNeko preferences file")
+            return {'CANCELLED'}
+
         self._preview_data = data
         self._build_entries(context, data)
         _ACTIVE_APPLY_OP = self
         return context.window_manager.invoke_props_dialog(self, width=520)
 
     def _build_entries(self, context, data):
-        """Fill the checkbox list from the preset data."""
         self.entries.clear()
 
         prefs_obj = context.preferences.addons[__package__].preferences
@@ -533,6 +556,7 @@ class XNEKO_OT_apply_preset(bpy.types.Operator):
             applied += 1
 
         _redraw_view3d(context)
+        _write_session()
         self.report(
             {'INFO'},
             f"Applied {applied}, skipped {skipped}",
@@ -601,11 +625,12 @@ class XNEKO_OT_apply_project_prefs(bpy.types.Operator):
     def execute(self, context):
         prefs_obj = context.preferences.addons[__package__].preferences
         data, present = prefs_io.get_project_data()
-        if not present or data is None:
+        if not present:
             self.report({'WARNING'}, "Project has no saved preferences")
             return {'CANCELLED'}
         applied, skipped = prefs_io.import_prefs(prefs_obj, core, data)
         _redraw_view3d(context)
+        _write_session()
         self.report(
             {'INFO'},
             f"Project prefs: applied {len(applied)}, skipped {len(skipped)}",
@@ -659,54 +684,79 @@ class XNEKO_OT_open_log_folder(bpy.types.Operator):
 # ==================================================
 # Toggle / handler callbacks
 # ==================================================
-def _on_save_to_project_toggle(self, context):
-    pass
-
-
 def _on_use_project_prefs_toggle(self, context):
     if not self.use_project_prefs:
         return
     data, present = prefs_io.get_project_data()
-    if not present or data is None:
+    if not present:
         return
     prefs_io.import_prefs(self, core, data)
     _redraw_view3d(context)
+    _write_session()
 
 
 @bpy.app.handlers.persistent
 def _on_load_post(dummy):
-    addon = bpy.context.preferences.addons.get(__package__)
-    if not addon:
-        return
-    p = addon.preferences
+    """Restore preferences when a .blend is loaded.
 
-    if not p.use_project_prefs:
-        return
+    Order of precedence:
+      1. If Use Project Preferences is enabled AND the loaded file
+         carries project prefs, apply those.
+      2. Otherwise fall back to the last session state (the state at
+         the time Blender was last closed).
 
-    data, present = prefs_io.get_project_data()
-    if not present or data is None:
-        return
+    The session fallback is important: without it, loading a .blend
+    that carries no prefs would leave the tool states exactly as the
+    previously loaded file left them, rather than as the user last
+    configured them.
+    """
+    try:
+        addon = bpy.context.preferences.addons.get(__package__)
+        if not addon:
+            return
+        p = addon.preferences
 
-    applied, skipped = prefs_io.import_prefs(p, core, data)
+        if p.use_project_prefs:
+            data, present = prefs_io.get_project_data()
+            if present:
+                applied, skipped = prefs_io.import_prefs(p, core, data)
+                print(f"[XNeko] Loaded project prefs: applied "
+                      f"{len(applied)}, skipped {len(skipped)}")
+                for short, reason in skipped:
+                    print(f"[XNeko]   skipped {short}: {reason}")
+                _redraw_view3d()
+                return
 
-    print(f"[XNeko] Loaded project prefs: applied {len(applied)}, "
-          f"skipped {len(skipped)}")
-    for short, reason in skipped:
-        print(f"[XNeko]   skipped {short}: {reason}")
-
-    _redraw_view3d()
+        # No project prefs (or the option is off): restore session.
+        apply_session_if_any()
+        _redraw_view3d()
+    except Exception as exc:
+        print(f"[XNeko] load_post handler failed: {exc}")
 
 
 @bpy.app.handlers.persistent
 def _on_save_pre(dummy):
-    addon = bpy.context.preferences.addons.get(__package__)
-    if not addon:
-        return
-    p = addon.preferences
-    if not p.save_to_project:
-        return
-    data = prefs_io.export_prefs(p, core, name="__project__")
-    prefs_io.set_project_data(data)
+    """Persist preferences when a .blend is saved.
+
+    Always refreshes the session file (so the state is retained even
+    if the user never saves preferences explicitly). Additionally,
+    writes the prefs into the .blend when Save Preferences to .blend
+    is enabled.
+    """
+    try:
+        addon = bpy.context.preferences.addons.get(__package__)
+        if not addon:
+            return
+        p = addon.preferences
+
+        data = prefs_io.export_prefs(p, core, name="__session__")
+        session_store.save_session(data)
+
+        if p.save_to_project:
+            project_data = prefs_io.export_prefs(p, core, name="__project__")
+            prefs_io.set_project_data(project_data)
+    except Exception as exc:
+        print(f"[XNeko] save_pre handler failed: {exc}")
 
 
 # ==================================================
@@ -715,13 +765,10 @@ def _on_save_pre(dummy):
 def _draw_preferences(self, context):
     layout = self.layout
 
-    # ---------- Registration issues warning ----------
     core.draw_registration_issues(self, layout)
 
-    # ---------- N panel category input ----------
     layout.prop(self, "panel_category")
 
-    # ---------- Rescan / Open Log Folder ----------
     row = layout.row(align=True)
     row.operator("xneko.rescan_tools", icon='FILE_REFRESH')
     row.operator("xneko.open_log_folder", icon='FILE_FOLDER')
@@ -861,7 +908,6 @@ def _draw_preferences(self, context):
             "xneko.shift_tab_page", text="", icon='TRIA_RIGHT',
         ).delta = 1
 
-        # ----- Toggles + per-tool preferences (collapsible) -----
         main_box = layout.box()
         for item in groups[self.active_category]:
             tool = core._TOOL_REGISTRY.get(item.tool_id)
@@ -933,12 +979,6 @@ XNekoPreferences = None
 
 
 def build_preferences_class():
-    """Construct XNekoPreferences with tool preference props baked
-    into __annotations__.
-
-    Must be called after core.discover_tools() and before
-    bpy.utils.register_class(XNekoPreferences).
-    """
     annotations = {
         "panel_category": StringProperty(
             name="N Panel Category",
@@ -947,7 +987,6 @@ def build_preferences_class():
                 "Use the same name as another add-on to merge them."
             ),
             default="XNeko Tools",
-            update=lambda self, ctx: refresh_panel_category(),
         ),
         "active_category": StringProperty(default=""),
         "tab_page": IntProperty(default=0),
@@ -962,13 +1001,12 @@ def build_preferences_class():
                 "preferences inside the project file"
             ),
             default=False,
-            update=lambda self, ctx: _on_save_to_project_toggle(self, ctx),
         ),
         "use_project_prefs": BoolProperty(
             name="Use Project Preferences",
             description=(
                 "When loading a .blend that stores preferences, "
-                "apply them instead of using the addon defaults"
+                "apply them instead of using the current session state"
             ),
             default=False,
             update=lambda self, ctx: _on_use_project_prefs_toggle(self, ctx),
@@ -980,7 +1018,6 @@ def build_preferences_class():
             description="Preset to apply",
         ),
 
-        # ---------- Registration metadata ----------
         "debug_registration": BoolProperty(
             name="Registration Debug Log",
             description=(
@@ -1032,10 +1069,10 @@ def _make_tool_namespace(tool):
 
 def get_tool_prefs(tool_id):
     """Public accessor for tools to read/write their own prefs."""
-    tool = core._TOOL_REGISTRY.get(tool_id)
-    if tool is None:
-        return None
-    return _make_tool_namespace(tool)
+    for tool in core._TOOL_REGISTRY.values():
+        if tool.get("tool_id") == tool_id:
+            return _make_tool_namespace(tool)
+    return None
 
 
 # ==================================================
@@ -1054,22 +1091,34 @@ def _on_toggle(item):
 
     _set_tool_enabled(item.tool_id, item.enabled)
     _redraw_view3d()
+    _write_session()
 
 
 def init_tool_toggles():
+    """Populate the toggle list from the registry defaults.
+
+    Session write is suppressed during this pass: the values here are
+    provisional and will be overwritten by apply_session_if_any() right
+    after, if a session file exists.
+    """
+    global _suppress_session_write
     prefs = bpy.context.preferences.addons.get(__package__)
     if not prefs:
         return
-    p = prefs.preferences
-    p.tool_toggles.clear()
-    for tool_id, tool in core._TOOL_REGISTRY.items():
-        item = p.tool_toggles.add()
-        item.tool_id = tool_id
-        item.display_name = tool["display_name"]
-        if tool.get("compatible", True):
-            item.enabled = tool["enabled_by_default"]
-        else:
-            item.enabled = False
+    _suppress_session_write = True
+    try:
+        p = prefs.preferences
+        p.tool_toggles.clear()
+        for tool_id, tool in core._TOOL_REGISTRY.items():
+            item = p.tool_toggles.add()
+            item.tool_id = tool_id
+            item.display_name = tool["display_name"]
+            if tool.get("compatible", True):
+                item.enabled = tool["enabled_by_default"]
+            else:
+                item.enabled = False
+    finally:
+        _suppress_session_write = False
 
 
 def clear_tool_toggles():
@@ -1083,11 +1132,6 @@ def clear_tool_toggles():
 # Panel category refresh (with rollback)
 # ==================================================
 def refresh_panel_category():
-    """Re-register all panels with the category name from preferences.
-
-    Uses a snapshot-and-rollback approach so a failure to re-register
-    never leaves the UI without any panels.
-    """
     prefs = bpy.context.preferences.addons.get(__package__)
     if not prefs:
         return
