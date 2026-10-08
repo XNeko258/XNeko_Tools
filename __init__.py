@@ -4,7 +4,7 @@
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 7, 5),
+    "version": (0, 8, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (
@@ -59,8 +59,20 @@ def register():
     bpy.utils.register_class(preferences.XNEKO_ApplyPresetEntry)
 
     # ---- 4. Build XNekoPreferences with dynamic per-tool props ----
+    # The duck-type filter in build_preferences_class catches the vast
+    # majority of bad props, but it is not a full RNA validation. If a
+    # prop still slips through and makes the class unregisterable, we
+    # rebuild without per-tool props so the addon itself stays alive.
     preferences.XNekoPreferences = preferences.build_preferences_class()
-    bpy.utils.register_class(preferences.XNekoPreferences)
+    try:
+        bpy.utils.register_class(preferences.XNekoPreferences)
+    except Exception as e:
+        print(f"[XNeko] XNekoPreferences registration failed: {e}")
+        print("[XNeko] retrying without per-tool preference props")
+        preferences.XNekoPreferences = (
+            preferences.build_preferences_class(include_tool_props=False)
+        )
+        bpy.utils.register_class(preferences.XNekoPreferences)
 
     # ---- 5. Write registration issues + plugin version into prefs ----
     try:
@@ -172,3 +184,8 @@ def unregister():
 
     # ---- 7. Clear plugin state ----
     core._state.clear()
+    # _state.clear() resets groups / issues / previews but deliberately
+    # leaves _TOOL_REGISTRY alone (discover_tools re-clears it on the
+    # next register). Clear it here too so a disabled addon does not
+    # expose a stale registry to external code.
+    core._TOOL_REGISTRY.clear()

@@ -365,49 +365,73 @@ def discover_tools(package_name, package_path):
         min_v = getattr(module, "blender_version_min", None)
         max_v = getattr(module, "blender_version_max", None)
 
-        _TOOL_REGISTRY[info.name] = {
-            "module_name": info.name,
-            "tool_id": tool_id,
-            "module": module,
-            "group_id": group_id,
-            "group_path": group_path,
-            "display_name": getattr(
-                module, "tool_name", short.replace("_", " ").title()
-            ),
-            "enabled_by_default": getattr(module, "tool_default_enabled", True),
-            "classes": tuple(classes),
-            "preference_classes": tuple(
-                getattr(module, "preference_classes", ())
-            ),
-            "preference_props": dict(
-                getattr(module, "preference_props", {})
-            ),
-            "preferences_in_addon": getattr(
-                module, "preferences_in_addon", True
-            ),
-            "draw_preferences": getattr(module, "draw_preferences", None),
-            "scene_props": dict(getattr(module, "scene_props", {})),
-            "on_load": getattr(module, "on_load", None),
-            "on_unload": getattr(module, "on_unload", None),
+        # ---- Build the tool record inside a try/except ----
+        # Rationale: user-authored tool modules are untrusted. A single
+        # malformed declaration (e.g. `classes = MyClass` instead of
+        # `classes = (MyClass,)`) would otherwise raise here and abort
+        # the whole addon registration. Isolating this block means one
+        # bad tool is skipped while every other tool still loads.
+        try:
+            _TOOL_REGISTRY[info.name] = {
+                "module_name": info.name,
+                "tool_id": tool_id,
+                "module": module,
+                "group_id": group_id,
+                "group_path": group_path,
+                "display_name": getattr(
+                    module, "tool_name", short.replace("_", " ").title()
+                ),
+                "enabled_by_default": getattr(module, "tool_default_enabled", True),
+                "classes": tuple(classes),
+                "preference_classes": tuple(
+                    getattr(module, "preference_classes", ())
+                ),
+                "preference_props": dict(
+                    getattr(module, "preference_props", {})
+                ),
+                "preferences_in_addon": getattr(
+                    module, "preferences_in_addon", True
+                ),
+                "draw_preferences": getattr(module, "draw_preferences", None),
+                "scene_props": dict(getattr(module, "scene_props", {})),
+                "on_load": getattr(module, "on_load", None),
+                "on_unload": getattr(module, "on_unload", None),
 
-            # Persisted version bounds (module-independent).
-            "version_min": list(min_v[:3]) if min_v else None,
-            "version_max": list(max_v[:3]) if max_v else None,
+                # Persisted version bounds (module-independent).
+                "version_min": list(min_v[:3]) if min_v else None,
+                "version_max": list(max_v[:3]) if max_v else None,
 
-            "compatible": True,
-            "incompatible_reason": "",
+                "compatible": True,
+                "incompatible_reason": "",
 
-            "loaded": False,
-        }
+                "loaded": False,
+            }
 
-        tool = _TOOL_REGISTRY[info.name]
-        ok, reason = _check_tool_compatibility(module)
-        tool["compatible"] = ok
-        tool["incompatible_reason"] = reason
-        if not ok:
-            print(f"[XNeko] {info.name}: {reason}")
+            tool = _TOOL_REGISTRY[info.name]
+            ok, reason = _check_tool_compatibility(module)
+            tool["compatible"] = ok
+            tool["incompatible_reason"] = reason
+            if not ok:
+                print(f"[XNeko] {info.name}: {reason}")
 
-        log_debug(f"Discovered tool module: {info.name} (tool_id={tool_id})")
+            log_debug(
+                f"Discovered tool module: {info.name} (tool_id={tool_id})"
+            )
+        except Exception as e:
+            # Roll back any half-written entry, then record the issue
+            # and move on to the next module.
+            _TOOL_REGISTRY.pop(info.name, None)
+            _state.registration_issues.append({
+                "type": "invalid_declaration",
+                "tool_id": tool_id,
+                "paths": [module_path],
+                "error": str(e),
+            })
+            _report_issue(
+                f"[XNeko] Failed to build tool record for "
+                f"{module_path}: {e}"
+            )
+            continue
 
 
 def collect_registration_issues():
@@ -774,14 +798,25 @@ def attach_panels_to_groups(tool=None):
 
         parent_id = parent_cls.bl_idname
         for cls in t["classes"]:
-            if not isinstance(cls, type) or not issubclass(cls, bpy.types.Panel):
-                continue
+            # Isolate per-class attachment. A malformed Panel (e.g. a
+            # class whose bl_options is None, or a custom __setattr__
+            # that rejects bl_parent_id) would otherwise raise here,
+            # propagate up through load_tool -> _on_toggle, and freeze
+            # the addon-preference checkbox for this tool.
+            try:
+                if not isinstance(cls, type) or not issubclass(cls, bpy.types.Panel):
+                    continue
 
-            cls.bl_parent_id = parent_id
+                cls.bl_parent_id = parent_id
 
-            existing = set(getattr(cls, "bl_options", set()))
-            if 'DEFAULT_CLOSED' not in existing:
-                cls.bl_options = existing | {'DEFAULT_CLOSED'}
+                existing = set(getattr(cls, "bl_options", None) or set())
+                if 'DEFAULT_CLOSED' not in existing:
+                    cls.bl_options = existing | {'DEFAULT_CLOSED'}
+            except Exception as e:
+                print(
+                    f"[XNeko] attach panel {cls!r} in "
+                    f"{t.get('tool_id', '?')} failed: {e}"
+                )
 
 
 # ============================================================
@@ -831,8 +866,16 @@ def load_tool(tool_id):
             except Exception as e:
                 print(f"[XNeko] register {cls.__name__} failed: {e}")
 
+    # ---- NEW: isolate Scene prop injection ----
+    # A malformed scene_prop (e.g. a plain string instead of a
+    # bpy.props property) would raise here and abort load_tool,
+    # leaving the tool half-loaded. Catch per-prop and continue.
     for name, prop in tool["scene_props"].items():
-        setattr(bpy.types.Scene, name, prop)
+        try:
+            setattr(bpy.types.Scene, name, prop)
+        except Exception as e:
+            print(f"[XNeko] Scene.{name} for {tool_id} failed: {e}")
+    # ---- END NEW ----
 
     if callable(tool["on_load"]):
         try:
@@ -944,11 +987,20 @@ def draw_registration_issues(self, layout):
             box.label(
                 text=f"Import failed: {issue.get('error', 'unknown error')}"
             )
+        # ---- NEW: show the two new issue types ----
+        elif issue_type == "invalid_declaration":
+            box.label(
+                text=f"Invalid tool declaration: "
+                     f"{issue.get('error', 'unknown error')}"
+            )
+        elif issue_type == "invalid_pref_prop":
+            box.label(
+                text=f"Invalid preference prop: "
+                     f"{issue.get('error', 'unknown error')}"
+            )
+        # ---- END NEW ----
         else:
             box.label(text=f"Tool id collision: {issue['tool_id']}")
-
-        for path in issue["paths"]:
-            box.label(text=f"  {path}")
 
 
 def draw_npanel_registration_warning(layout):
