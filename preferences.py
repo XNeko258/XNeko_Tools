@@ -11,6 +11,29 @@ from . import core
 from .common import prefs_io, preset_store, session_store
 
 
+def _is_property_like(value):
+    """Best-effort check that `value` is a bpy.props.* property.
+
+    In Blender 2.8+ bpy.props.XxxProperty() returns a _PropertyDeferred
+    instance whose 'function' attribute holds the factory callable
+    (e.g. BoolProperty itself), NOT a string. Older builds may return
+    a bare RNA property descriptor. Accept either shape.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return False
+
+    # Primary path: _PropertyDeferred exposes the factory as 'function'.
+    fn = getattr(value, "function", None)
+    if callable(fn):
+        return True
+
+    # Fallback: any object already shaped like an RNA property.
+    try:
+        return isinstance(value, bpy.types.Property)
+    except Exception:
+        return False
+
+
 # ---------------- Link configuration ----------------
 # (label, url, icon, author)
 LINKS = (
@@ -134,7 +157,21 @@ def _set_tool_enabled(tool_id, enabled):
 
 
 def _redraw_view3d(context=None):
-    screen = (context.screen if context else None) or bpy.context.screen
+    # bpy.context during addon registration is a _RestrictContext that
+    # has no 'screen'. Accessing it raises AttributeError. Since this
+    # helper is called from property update callbacks that also fire
+    # during init_tool_toggles(), every access must be defensive.
+    screen = None
+    if context is not None:
+        try:
+            screen = context.screen
+        except Exception:
+            screen = None
+    if screen is None:
+        try:
+            screen = bpy.context.screen
+        except Exception:
+            return
     if screen is None:
         return
     for area in screen.areas:
@@ -287,11 +324,18 @@ class XNEKO_ApplyPresetEntry(bpy.types.PropertyGroup):
 # ==================================================
 # Preset enumerator
 # ==================================================
+# Sentinel identifier for "no preset selected". Always present in
+# _preset_items so EnumProperty never fails to resolve its current
+# value. Must not collide with any real preset name (sanitize_name
+# strips leading underscores from Windows-reserved names but does not
+# forbid them, so "__none__" is safe enough in practice).
+NONE_PRESET_ID = "__none__"
+
+
 def _preset_items(self, context):
-    names = _get_preset_list()
-    if not names:
-        return [("", "(No presets)", "No preset files found")]
-    return [(n, n, f"Preset: {n}") for n in names]
+    items = [(NONE_PRESET_ID, "(No preset)", "No preset selected")]
+    items += [(n, n, f"Preset: {n}") for n in _get_preset_list()]
+    return items
 
 
 # ==================================================
@@ -808,16 +852,25 @@ def _draw_preferences(self, context):
     layout.separator()
     layout.label(text="Presets:", icon='PRESET')
 
-    if self.selected_preset:
-        if self.selected_preset not in _get_preset_list():
-            self.selected_preset = ""
+    # If the stored preset vanished (deleted from disk, or a preset
+    # from an older install), fall back to the sentinel instead of
+    # writing "" which EnumProperty cannot resolve.
+    if (self.selected_preset
+            and self.selected_preset != NONE_PRESET_ID
+            and self.selected_preset not in _get_preset_list()):
+        self.selected_preset = NONE_PRESET_ID
 
     row = layout.row(align=True)
     row.prop(self, "selected_preset", text="")
 
+    has_preset = bool(
+        self.selected_preset
+        and self.selected_preset != NONE_PRESET_ID
+    )
+
     sub = row.row(align=True)
     sub.scale_x = 0.45
-    sub.enabled = bool(self.selected_preset)
+    sub.enabled = has_preset
     sub.operator(
         "xneko.apply_preset", text="Apply", icon='CHECKMARK',
     ).preset_name = self.selected_preset
@@ -978,7 +1031,14 @@ def _draw_preferences(self, context):
 XNekoPreferences = None
 
 
-def build_preferences_class():
+def build_preferences_class(include_tool_props=True):
+    """Build the dynamic AddonPreferences class.
+
+    When include_tool_props is False, per-tool preference props are
+    skipped entirely. Used as a last-resort fallback when registering
+    the full class fails: the addon itself still loads and the user
+    keeps every feature except the tool preference UI.
+    """
     annotations = {
         "panel_category": StringProperty(
             name="N Panel Category",
@@ -1016,6 +1076,10 @@ def build_preferences_class():
             name="Preset",
             items=_preset_items,
             description="Preset to apply",
+            # 'items' is a callback, so 'default' must be an integer
+            # index, not an identifier. _preset_items always puts the
+            # sentinel at index 0, so 0 == NONE_PRESET_ID.
+            default=0,
         ),
 
         "debug_registration": BoolProperty(
@@ -1037,10 +1101,45 @@ def build_preferences_class():
         ),
     }
 
+    if not include_tool_props:
+        # Strip fallback: no per-tool props, no _pref_names either.
+        # Tools that try to read their own prefs will get an empty
+        # namespace and should degrade gracefully.
+        for _tool in core._TOOL_REGISTRY.values():
+            _tool["_pref_names"] = {}
+        return type(
+            "XNekoPreferences",
+            (bpy.types.AddonPreferences,),
+            {
+                "bl_idname": __package__,
+                "__annotations__": annotations,
+                "draw": _draw_preferences,
+            },
+        )
+
     for tool_id, tool in core._TOOL_REGISTRY.items():
         prefix = _make_pref_prefix(tool_id)
         names = {}
         for name, prop in tool.get("preference_props", {}).items():
+            # Reject anything that is not a real bpy.props property.
+            # A single bad prop would make the whole dynamically-built
+            # XNekoPreferences class fail to register, taking the entire
+            # addon down with it. Drop the bad one and keep going.
+            if not _is_property_like(prop):
+                core._state.registration_issues.append({
+                    "type": "invalid_pref_prop",
+                    "tool_id": tool_id,
+                    "paths": [f"{tool_id}.preference_props['{name}']"],
+                    "error": (
+                        f"value is {type(prop).__name__}, expected a "
+                        f"bpy.props property (e.g. BoolProperty())"
+                    ),
+                })
+                print(
+                    f"[XNeko] dropped preference_props['{name}'] of "
+                    f"{tool_id}: not a bpy.props property"
+                )
+                continue
             full = prefix + name
             names[name] = full
             annotations[full] = prop

@@ -1,0 +1,1 @@
+# Importer internals for the UE Format tool. Not a tool package.
