@@ -9,6 +9,7 @@ from bpy_extras.io_utils import ImportHelper
 
 from . import core
 from .common import prefs_io, preset_store, session_store
+from .common import error_reports as _reports
 
 
 def _is_property_like(value):
@@ -708,20 +709,67 @@ class XNEKO_OT_rescan_tools(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class XNEKO_OT_open_log_folder(bpy.types.Operator):
-    bl_idname = "xneko.open_log_folder"
-    bl_label = "Open Log Folder"
-    bl_description = "Open the plugin log folder"
+class XNEKO_OT_open_user_reports_folder(bpy.types.Operator):
+    bl_idname = "xneko.open_user_reports_folder"
+    bl_label = "Open Tool Reports"
+    bl_description = "Open the folder holding tool-module error reports"
     bl_options = {'INTERNAL'}
 
     def execute(self, context):
-        path = core.get_log_dir()
+        path = _reports.user_reports_dir()
         try:
             os.makedirs(path, exist_ok=True)
         except Exception as e:
-            self.report({'ERROR'}, f"Cannot create log folder: {e}")
+            self.report({'ERROR'}, f"Cannot create folder: {e}")
             return {'CANCELLED'}
         bpy.ops.wm.path_open(filepath=path)
+        return {'FINISHED'}
+
+
+class XNEKO_OT_open_critical_reports_folder(bpy.types.Operator):
+    bl_idname = "xneko.open_critical_reports_folder"
+    bl_label = "Open Critical Reports"
+    bl_description = "Open the folder holding critical error reports"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        path = _reports.critical_reports_dir()
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception as e:
+            self.report({'ERROR'}, f"Cannot create folder: {e}")
+            return {'CANCELLED'}
+        bpy.ops.wm.path_open(filepath=path)
+        return {'FINISHED'}
+
+
+class XNEKO_OT_clear_user_reports(bpy.types.Operator):
+    bl_idname = "xneko.clear_user_reports"
+    bl_label = "Clear Tool Reports"
+    bl_description = "Delete all tool-module error reports"
+    bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        removed = _reports.clear_user_reports()
+        self.report({'INFO'}, f"Removed {removed} report(s)")
+        return {'FINISHED'}
+
+
+class XNEKO_OT_clear_critical_reports(bpy.types.Operator):
+    bl_idname = "xneko.clear_critical_reports"
+    bl_label = "Clear Critical Reports"
+    bl_description = "Delete all critical error reports"
+    bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        removed = _reports.clear_critical_reports()
+        self.report({'INFO'}, f"Removed {removed} critical report(s)")
         return {'FINISHED'}
 
 
@@ -815,7 +863,6 @@ def _draw_preferences(self, context):
 
     row = layout.row(align=True)
     row.operator("xneko.rescan_tools", icon='FILE_REFRESH')
-    row.operator("xneko.open_log_folder", icon='FILE_FOLDER')
 
     # ---------- Project File (collapsible) ----------
     layout.separator()
@@ -1009,6 +1056,55 @@ def _draw_preferences(self, context):
                 for name in tool["preference_props"]:
                     ns.prop(sub_box, name)
 
+
+    # ---------- Diagnostics (collapsed by default) ----------
+    layout.separator()
+
+    header = layout.row(align=True)
+    arrow = (
+        'TRIA_DOWN' if self.diagnostics_section_expanded
+        else 'TRIA_RIGHT'
+    )
+    header.prop(
+        self, "diagnostics_section_expanded",
+        text="", icon=arrow, emboss=False,
+    )
+    header.label(text="Diagnostics:", icon='TEXT')
+
+    if self.diagnostics_section_expanded:
+        box = layout.box()
+
+        # ---- Optional: tool-module reports ----
+        box.prop(self, "enable_error_report")
+
+        user_row = box.row(align=True)
+        user_row.operator(
+            "xneko.open_user_reports_folder",
+            text="Open Tool Reports", icon='FILE_FOLDER',
+        )
+        user_row.operator(
+            "xneko.clear_user_reports", text="Clear", icon='TRASH',
+        )
+
+        # ---- Forced: critical reports ----
+        box.separator()
+
+        crit_note = box.row()
+        crit_note.enabled = False
+        crit_note.label(
+            text="Critical errors are always logged.",
+            icon='ERROR',
+        )
+
+        crit_row = box.row(align=True)
+        crit_row.operator(
+            "xneko.open_critical_reports_folder",
+            text="Open Critical Reports", icon='FILE_FOLDER',
+        )
+        crit_row.operator(
+            "xneko.clear_critical_reports", text="Clear", icon='TRASH',
+        )
+
     # ---------- Links ----------
     layout.separator()
     layout.label(text="Links:", icon='BOOKMARKS')
@@ -1082,11 +1178,17 @@ def build_preferences_class(include_tool_props=True):
             default=0,
         ),
 
-        "debug_registration": BoolProperty(
-            name="Registration Debug Log",
+        "diagnostics_section_expanded": BoolProperty(default=False),
+
+        "enable_error_report": BoolProperty(
+            name="Enable Error Reporting",
             description=(
-                "Print detailed tool discovery and registration logs "
-                "to the console."
+                "When enabled, tool-module errors (import failures, "
+                "invalid declarations, dropped preference props, "
+                "panel attach failures) are written to "
+                "logs/reports/. Disabled by default. Errors inside "
+                "the addon itself always write to logs/critical/ "
+                "regardless of this setting."
             ),
             default=False,
         ),
@@ -1138,6 +1240,25 @@ def build_preferences_class(include_tool_props=True):
                 print(
                     f"[XNeko] dropped preference_props['{name}'] of "
                     f"{tool_id}: not a bpy.props property"
+                )
+
+                mod = tool.get("module")
+                mod_file = (
+                    getattr(mod, "__file__", None) if mod else None
+                )
+
+                _reports.report_tool_error(
+                    "invalid preference prop dropped",
+                    extra={
+                        "tool_id": tool_id,
+                        "name": name,
+                        "value_type": type(prop).__name__,
+                        "file": mod_file,
+                        "field": "preference_props",
+                        "line": core.find_assignment_line(
+                            mod_file, "preference_props"
+                        ),
+                    },
                 )
                 continue
             full = prefix + name

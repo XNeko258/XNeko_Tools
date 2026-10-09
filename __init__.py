@@ -4,7 +4,7 @@
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 8, 0),
+    "version": (0, 8, 5),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (
@@ -21,6 +21,7 @@ import bpy
 
 from . import core
 from . import preferences
+from .common import error_reports as _reports
 
 
 def _register_preference_classes():
@@ -31,7 +32,13 @@ def _register_preference_classes():
             try:
                 bpy.utils.register_class(cls)
             except Exception as e:
-                print(f"[XNeko] preference class {cls.__name__} failed: {e}")
+                print(
+                    f"[XNeko] preference class {cls.__name__} failed: {e}"
+                )
+                _reports.report_tool_error(
+                    f"preference class failed: {cls.__name__}",
+                    exc=e,
+                )
 
 
 def _unregister_preference_classes():
@@ -46,6 +53,22 @@ def _unregister_preference_classes():
 
 
 def register():
+    """Top-level register entry.
+
+    Wraps _register_impl so any unexpected exception is written to
+    logs/critical/ before propagation. The exception is still
+    re-raised so Blender knows the addon failed to load.
+    """
+    try:
+        _register_impl()
+    except Exception as e:
+        _reports.report_critical_error(
+            "addon register() failed", exc=e,
+        )
+        raise
+
+
+def _register_impl():
     # ---- 1. Discovery + issue collection ----
     core._initialize_tools()
 
@@ -69,10 +92,23 @@ def register():
     except Exception as e:
         print(f"[XNeko] XNekoPreferences registration failed: {e}")
         print("[XNeko] retrying without per-tool preference props")
+        # Addon infrastructure failure: always-on critical channel.
+        _reports.report_critical_error(
+            "XNekoPreferences registration failed",
+            exc=e,
+            extra={"fallback": "include_tool_props=False"},
+        )
         preferences.XNekoPreferences = (
             preferences.build_preferences_class(include_tool_props=False)
         )
         bpy.utils.register_class(preferences.XNekoPreferences)
+
+    # ---- 4b. Flush tool reports queued during discovery ----
+    # Discovery runs before preferences are registered, so tool
+    # reports raised there are buffered. Now that XNekoPreferences
+    # exists, the user toggle can be read and pending reports
+    # written. No-op if the queue is empty or the toggle is off.
+    _reports.flush_pending()
 
     # ---- 5. Write registration issues + plugin version into prefs ----
     try:
@@ -108,7 +144,10 @@ def register():
         "XNEKO_OT_apply_project_prefs",
         "XNEKO_OT_clear_project_prefs",
         "XNEKO_OT_rescan_tools",
-        "XNEKO_OT_open_log_folder",
+        "XNEKO_OT_open_user_reports_folder",
+        "XNEKO_OT_open_critical_reports_folder",
+        "XNEKO_OT_clear_user_reports",
+        "XNEKO_OT_clear_critical_reports",
     ):
         cls = getattr(preferences, name, None)
         if cls is None:
@@ -147,7 +186,10 @@ def unregister():
         "XNEKO_OT_import_prefs",
         "XNEKO_OT_export_prefs",
         "XNEKO_OT_rescan_tools",
-        "XNEKO_OT_open_log_folder",
+        "XNEKO_OT_open_user_reports_folder",
+        "XNEKO_OT_open_critical_reports_folder",
+        "XNEKO_OT_clear_user_reports",
+        "XNEKO_OT_clear_critical_reports",
     ):
         cls = getattr(preferences, name, None)
         if cls is None:

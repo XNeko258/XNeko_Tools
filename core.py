@@ -8,6 +8,8 @@ import os
 import re
 import json
 
+from .common import error_reports as _reports
+
 
 # ============================================================
 # Constants
@@ -27,8 +29,6 @@ REGISTRATION_INVALID_TOOL_ID = "invalid_tool_id"
 REGISTRATION_DUPLICATE_TOOL_ID = "duplicate_tool_id"
 
 LOG_DIR_NAME = "logs"
-LOG_FILE_NAME = "xneko_tools.log"
-LOG_FILE_MAX_BYTES = 1024 * 1024
 
 
 # ============================================================
@@ -39,7 +39,6 @@ class PluginState:
         self.registered_groups = {}
         self.registration_issues = []
         self.icon_previews = None
-        self.debug_fallback = False
 
     def reset_registration(self):
         self.registered_groups.clear()
@@ -49,8 +48,8 @@ class PluginState:
         if self.icon_previews is not None:
             try:
                 bpy.utils.previews.remove(self.icon_previews)
-            except Exception as exc:
-                log_debug(f"Failed to remove stale preview collection: {exc}")
+            except Exception:
+                pass
             self.icon_previews = None
 
         self.icon_previews = bpy.utils.previews.new()
@@ -62,8 +61,8 @@ class PluginState:
         if self.icon_previews is not None:
             try:
                 bpy.utils.previews.remove(self.icon_previews)
-            except Exception as exc:
-                log_debug(f"Failed to remove preview collection: {exc}")
+            except Exception:
+                pass
             self.icon_previews = None
 
         self.registered_groups.clear()
@@ -148,32 +147,6 @@ def is_valid_tool_id(tool_id):
 # ============================================================
 # Logging
 # ============================================================
-def set_debug_fallback(enabled):
-    _state.debug_fallback = bool(enabled)
-
-
-def _is_debug_enabled():
-    enabled = _state.debug_fallback
-    try:
-        addon = bpy.context.preferences.addons.get(__package__)
-        if addon is not None:
-            enabled = bool(
-                getattr(addon.preferences, "debug_registration", False)
-            )
-    except Exception:
-        pass
-    return enabled
-
-
-def log_debug(message):
-    if _is_debug_enabled():
-        print(f"[XNeko_Tools] {message}")
-
-
-# Writability probes are cached per folder. Directory writability does
-# not change at runtime in normal use, so one probe per path is enough.
-# The cache is cleared on rescan_tools() so permission changes are
-# picked up without a restart.
 _dir_writable_cache = {}
 
 
@@ -210,27 +183,8 @@ def get_log_dir():
     )
 
 
-def get_log_file_path():
-    return os.path.join(get_log_dir(), LOG_FILE_NAME)
-
-
-def log_to_file(message):
-    if not _is_debug_enabled():
-        return
-    try:
-        path = get_log_file_path()
-        if os.path.exists(path) and os.path.getsize(path) > LOG_FILE_MAX_BYTES:
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("")
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(message + "\n")
-    except Exception:
-        pass
-
-
 def _report_issue(line):
     print(line)
-    log_to_file(line)
 
 
 def get_plugin_version():
@@ -239,6 +193,60 @@ def get_plugin_version():
         return ".".join(str(v) for v in bl_info["version"])
     except Exception:
         return "0.0.0"
+
+
+# ============================================================
+# Source location helpers (used by error reports)
+# ============================================================
+def find_assignment_line(module_path, var_name):
+    """Return the line number of `var_name = ...` in module_path.
+
+    Used to point an error report at the exact line the user wrote,
+    since the exception is raised inside core.py when the declared
+    value is coerced, not in the tool module itself.
+
+    Best effort: returns None if the file is unreadable, has a
+    syntax error, or the assignment cannot be located.
+    """
+    if not module_path or not os.path.isfile(module_path):
+        return None
+    try:
+        import ast
+        with open(module_path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source, filename=module_path)
+    except Exception:
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = (
+            node.targets if isinstance(node, ast.Assign)
+            else [node.target]
+        )
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == var_name:
+                return node.lineno
+    return None
+
+
+def find_class_line(module_path, class_name):
+    """Return the line of `class class_name:` in module_path."""
+    if not module_path or not os.path.isfile(module_path):
+        return None
+    try:
+        import ast
+        with open(module_path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source, filename=module_path)
+    except Exception:
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return node.lineno
+    return None
 
 
 # ============================================================
@@ -312,6 +320,52 @@ def discover_tools(package_name, package_path):
                 "error": str(e),
             })
             _report_issue(f"[XNeko] import failed {info.name}: {e}")
+
+            # Extract the failing frame inside the tool module from
+            # the import traceback, so the report can point at it.
+            failed_file = None
+            failed_line = None
+            tb = getattr(e, "__traceback__", None)
+            while tb is not None:
+                fname = tb.tb_frame.f_code.co_filename
+                if os.path.isfile(fname) and package_path[0] in fname:
+                    failed_file = fname
+                    failed_line = tb.tb_lineno
+                tb = tb.tb_next
+
+            _reports.report_tool_error(
+                "tool module import failed",
+                exc=e,
+                extra={
+                    "module": info.name,
+                    "file": failed_file or info.name,
+                    "line": failed_line,
+                },
+            )
+            continue
+
+            # The import traceback already contains the failing line
+            # inside the tool module. Extract it so the report can
+            # point straight at it.
+            failed_file = None
+            failed_line = None
+            tb = getattr(e, "__traceback__", None)
+            while tb is not None:
+                fname = tb.tb_frame.f_code.co_filename
+                if os.path.isfile(fname) and package_path[0] in fname:
+                    failed_file = fname
+                    failed_line = tb.tb_lineno
+                tb = tb.tb_next
+
+            _reports.report_tool_error(
+                "tool module import failed",
+                exc=e,
+                extra={
+                    "module": info.name,
+                    "file": failed_file or info.name,
+                    "line": failed_line,
+                },
+            )
             continue
 
         classes = getattr(module, "classes", None)
@@ -371,7 +425,30 @@ def discover_tools(package_name, package_path):
         # `classes = (MyClass,)`) would otherwise raise here and abort
         # the whole addon registration. Isolating this block means one
         # bad tool is skipped while every other tool still loads.
+        #
+        # current_field tracks which declaration is being coerced so
+        # the report can name it and locate the source line via AST.
+        current_field = "?"
+
         try:
+            current_field = "classes"
+            classes_seq = tuple(classes)
+
+            current_field = "preference_classes"
+            pref_classes_seq = tuple(
+                getattr(module, "preference_classes", ())
+            )
+
+            current_field = "preference_props"
+            pref_props_dict = dict(
+                getattr(module, "preference_props", {})
+            )
+
+            current_field = "scene_props"
+            scene_props_dict = dict(
+                getattr(module, "scene_props", {})
+            )
+
             _TOOL_REGISTRY[info.name] = {
                 "module_name": info.name,
                 "tool_id": tool_id,
@@ -381,19 +458,19 @@ def discover_tools(package_name, package_path):
                 "display_name": getattr(
                     module, "tool_name", short.replace("_", " ").title()
                 ),
-                "enabled_by_default": getattr(module, "tool_default_enabled", True),
-                "classes": tuple(classes),
-                "preference_classes": tuple(
-                    getattr(module, "preference_classes", ())
+                "enabled_by_default": getattr(
+                    module, "tool_default_enabled", True
                 ),
-                "preference_props": dict(
-                    getattr(module, "preference_props", {})
-                ),
+                "classes": classes_seq,
+                "preference_classes": pref_classes_seq,
+                "preference_props": pref_props_dict,
                 "preferences_in_addon": getattr(
                     module, "preferences_in_addon", True
                 ),
-                "draw_preferences": getattr(module, "draw_preferences", None),
-                "scene_props": dict(getattr(module, "scene_props", {})),
+                "draw_preferences": getattr(
+                    module, "draw_preferences", None
+                ),
+                "scene_props": scene_props_dict,
                 "on_load": getattr(module, "on_load", None),
                 "on_unload": getattr(module, "on_unload", None),
 
@@ -413,10 +490,6 @@ def discover_tools(package_name, package_path):
             tool["incompatible_reason"] = reason
             if not ok:
                 print(f"[XNeko] {info.name}: {reason}")
-
-            log_debug(
-                f"Discovered tool module: {info.name} (tool_id={tool_id})"
-            )
         except Exception as e:
             # Roll back any half-written entry, then record the issue
             # and move on to the next module.
@@ -430,6 +503,21 @@ def discover_tools(package_name, package_path):
             _report_issue(
                 f"[XNeko] Failed to build tool record for "
                 f"{module_path}: {e}"
+            )
+
+            # Locate the exact line the user wrote for this field.
+            line = find_assignment_line(module_path, current_field)
+
+            _reports.report_tool_error(
+                f"tool declaration parse failed: {current_field}",
+                exc=e,
+                extra={
+                    "module": info.name,
+                    "tool_id": tool_id,
+                    "file": module_path,
+                    "field": current_field,
+                    "line": line,
+                },
             )
             continue
 
@@ -503,7 +591,6 @@ def register_tool_module(module, registry):
 
     for existing in registry.values():
         if existing.get("tool_id") == tool_id:
-            log_debug(f"Tool id already registered: '{tool_id}'")
             return False, REGISTRATION_DUPLICATE_TOOL_ID
 
     rel_parts = module_name.split(".")
@@ -549,7 +636,6 @@ def register_tool_module(module, registry):
         "loaded": False,
     }
 
-    log_debug(f"Registered tool: {tool_id} from {module_name}")
     return True, REGISTRATION_OK
 
 
@@ -599,15 +685,13 @@ def load_group_icon_preview(group_name, group_path, icon_value):
         image_path = os.path.join(group_path, image_path)
 
     if not os.path.exists(image_path):
-        log_debug(f"Group icon image not found for {group_name}: {image_path}")
         return None
 
     probe = None
     try:
         probe = bpy.data.images.load(image_path, check_existing=False)
         width, height = probe.size
-    except Exception as exc:
-        log_debug(f"Failed to probe group icon image for {group_name}: {exc}")
+    except Exception:
         return None
     finally:
         if probe is not None:
@@ -617,17 +701,9 @@ def load_group_icon_preview(group_name, group_path, icon_value):
                 pass
 
     if width <= 0 or height <= 0:
-        log_debug(
-            f"Invalid group icon image size for {group_name}: "
-            f"{width}x{height}"
-        )
         return None
 
     if width > MAX_ICON_DIMENSION or height > MAX_ICON_DIMENSION:
-        log_debug(
-            f"Group icon image too large for {group_name}: "
-            f"{width}x{height} (max {MAX_ICON_DIMENSION})"
-        )
         return None
 
     previews = _state.get_previews()
@@ -637,8 +713,7 @@ def load_group_icon_preview(group_name, group_path, icon_value):
 
     try:
         previews.load(key, image_path, "IMAGE")
-    except Exception as exc:
-        log_debug(f"Failed to load group icon image for {group_name}: {exc}")
+    except Exception:
         return None
 
     return key
@@ -657,8 +732,8 @@ def resolve_group_icon(group_name, group_path):
             try:
                 spec.loader.exec_module(mod)
                 raw_value = getattr(mod, "group_icon", None)
-            except Exception as exc:
-                log_debug(f"Failed to read group icon from {init_file}: {exc}")
+            except Exception:
+                pass
 
     if not raw_value:
         return {"type": "builtin", "value": _get_group_icon(group_name)}
@@ -680,10 +755,6 @@ def build_group_registry(groups, registered_groups):
             "path": group_path,
             "icon": icon_info,
         }
-        log_debug(
-            f"Group '{group_name}' icon resolved: "
-            f"type={icon_info['type']}, value={icon_info['value']}"
-        )
 
 
 # ============================================================
@@ -711,10 +782,8 @@ def rescan_tools():
     _state.reset_previews()
     _initialize_tools()
 
-    # Clear the folder writability cache so permission changes (e.g.
-    # the user made the addon folder writable) are picked up without
-    # a restart.
-    _dir_writable_cache.clear()
+    # Allow critical errors to be re-logged after a rescan.
+    _reports.reset_dedup()
 
     try:
         prefs = bpy.context.preferences.addons[__package__].preferences
@@ -775,6 +844,11 @@ def register_group_panels(category="XNeko Tools"):
             bpy.utils.register_class(cls)
         except Exception as e:
             print(f"[XNeko] group panel {gid} failed: {e}")
+            _reports.report_tool_error(
+                "group panel registration failed",
+                exc=e,
+                extra={"group": gid},
+            )
 
 
 def unregister_group_panels():
@@ -813,9 +887,30 @@ def attach_panels_to_groups(tool=None):
                 if 'DEFAULT_CLOSED' not in existing:
                     cls.bl_options = existing | {'DEFAULT_CLOSED'}
             except Exception as e:
+                cls_name = getattr(cls, "__name__", repr(cls))
                 print(
-                    f"[XNeko] attach panel {cls!r} in "
+                    f"[XNeko] attach panel {cls_name} in "
                     f"{t.get('tool_id', '?')} failed: {e}"
+                )
+
+                mod = t.get("module")
+                mod_file = (
+                    getattr(mod, "__file__", None) if mod else None
+                )
+                line = None
+                if mod_file:
+                    line = find_class_line(mod_file, cls_name)
+
+                _reports.report_tool_error(
+                    "panel attach to group failed",
+                    exc=e,
+                    extra={
+                        "tool_id": t.get("tool_id", "?"),
+                        "cls": cls_name,
+                        "file": mod_file,
+                        "field": f"class {cls_name}",
+                        "line": line,
+                    },
                 )
 
 
@@ -859,10 +954,6 @@ def load_tool(tool_id):
         if isinstance(cls, type) and not issubclass(cls, bpy.types.PropertyGroup):
             try:
                 bpy.utils.register_class(cls)
-                log_debug(
-                    f"Registered class: {cls.__name__} "
-                    f"(bl_idname={getattr(cls, 'bl_idname', 'N/A')})"
-                )
             except Exception as e:
                 print(f"[XNeko] register {cls.__name__} failed: {e}")
 
@@ -870,11 +961,26 @@ def load_tool(tool_id):
     # A malformed scene_prop (e.g. a plain string instead of a
     # bpy.props property) would raise here and abort load_tool,
     # leaving the tool half-loaded. Catch per-prop and continue.
+    tool_file = getattr(tool["module"], "__file__", None)
+
     for name, prop in tool["scene_props"].items():
         try:
             setattr(bpy.types.Scene, name, prop)
         except Exception as e:
             print(f"[XNeko] Scene.{name} for {tool_id} failed: {e}")
+            _reports.report_tool_error(
+                "scene prop injection failed",
+                exc=e,
+                extra={
+                    "tool_id": tool_id,
+                    "prop": name,
+                    "file": tool_file,
+                    "field": "scene_props",
+                    "line": find_assignment_line(
+                        tool_file, "scene_props"
+                    ),
+                },
+            )
     # ---- END NEW ----
 
     if callable(tool["on_load"]):
@@ -884,10 +990,6 @@ def load_tool(tool_id):
             print(f"[XNeko] on_load for {tool_id} failed: {e}")
 
     tool["loaded"] = True
-    log_debug(
-        f"Tool registration complete: {tool_id}, "
-        f"classes={len(tool['classes'])}"
-    )
 
 
 def unload_tool(tool_id):
