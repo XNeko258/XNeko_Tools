@@ -11,6 +11,8 @@ bl_info = {
         "This is a toolbox, you can freely modify any of its "
         "functions yourself, good luck"
     ),
+    "doc_url": "https://github.com/XNeko258/XNeko_Tools",
+    "tracker_url": "https://github.com/XNeko258/XNeko_Tools/issues",
     "category": "System",
 }
 
@@ -164,6 +166,9 @@ def _register_impl():
 
 
 def unregister():
+    from .common import icon_store as _icon_store
+    _icon_store.clear()
+
     # ---- 0. Handlers first ----
     try:
         bpy.app.handlers.save_pre.remove(preferences._on_save_pre)
