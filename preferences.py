@@ -10,6 +10,7 @@ from bpy_extras.io_utils import ImportHelper
 from . import core
 from .common import prefs_io, preset_store, session_store
 from .common import error_reports as _reports
+from .common import icon_store
 
 
 def _is_property_like(value):
@@ -36,12 +37,20 @@ def _is_property_like(value):
 
 
 # ---------------- Link configuration ----------------
-# (label, url, icon, author)
+# Each entry: (label, url, icon, author)
+#
+# `icon` accepts three forms:
+#   - Blender built-in icon name, e.g. "URL", "WORLD", "FILE_IMAGE"
+#   - Image path relative to the plugin root, e.g. "icons/patreon.png"
+#   - "" or None for no icon
 LINKS = (
-    ("Patreon", "https://www.patreon.com/c/XNeko_258",              "FUND",         "XNeko"),
-    ("X",       "https://x.com/XNeko_258",                          "URL",          "XNeko"),
-    ("Bluesky", "https://bsky.app/profile/xneko258.bsky.social",    "URL",          "XNeko"),
-    ("Iwara",   "https://www.iwara.tv/profile/shaoqin",             "FILE_MOVIE",   "Shao qin"),
+    # ("Patreon", "https://www.patreon.com/...", "icons/patreon.png", "XNeko"),
+    ("Patreon", "https://www.patreon.com/c/XNeko_258",              "icons/Patreon.webp",   "XNeko"),
+    ("X",       "https://x.com/XNeko_258",                          "icons/x.webp",         "XNeko"),
+    ("Bluesky", "https://bsky.app/profile/xneko258.bsky.social",    "icons/bluesky.webp",   "XNeko"),
+    ("Github",  "https://github.com/XNeko258",                      "icons/github.webp",    "XNeko"),
+
+    ("Iwara",   "https://www.iwara.tv/profile/shaoqin",             "icons/iwara.webp",     "Shao qin"),
 )
 
 
@@ -895,169 +904,187 @@ def _draw_preferences(self, context):
         else:
             info_row.label(text="No preferences in this project", icon='INFO')
 
-    # ---------- Presets ----------
+    # ---------- Presets (collapsible) ----------
     layout.separator()
-    layout.label(text="Presets:", icon='PRESET')
 
-    # If the stored preset vanished (deleted from disk, or a preset
-    # from an older install), fall back to the sentinel instead of
-    # writing "" which EnumProperty cannot resolve.
-    if (self.selected_preset
-            and self.selected_preset != NONE_PRESET_ID
-            and self.selected_preset not in _get_preset_list()):
-        self.selected_preset = NONE_PRESET_ID
-
-    row = layout.row(align=True)
-    row.prop(self, "selected_preset", text="")
-
-    has_preset = bool(
-        self.selected_preset
-        and self.selected_preset != NONE_PRESET_ID
+    header = layout.row(align=True)
+    arrow = (
+        'TRIA_DOWN' if self.presets_section_expanded
+        else 'TRIA_RIGHT'
     )
+    header.prop(
+        self, "presets_section_expanded",
+        text="", icon=arrow, emboss=False,
+    )
+    header.label(text="Presets:", icon='PRESET')
 
-    sub = row.row(align=True)
-    sub.scale_x = 0.45
-    sub.enabled = has_preset
-    sub.operator(
-        "xneko.apply_preset", text="Apply", icon='CHECKMARK',
-    ).preset_name = self.selected_preset
-    sub.operator(
-        "xneko.delete_preset", text="Delete", icon='TRASH',
-    ).preset_name = self.selected_preset
+    if self.presets_section_expanded:
+        # If the stored preset vanished (deleted from disk, or a preset
+        # from an older install), fall back to the sentinel instead of
+        # writing "" which EnumProperty cannot resolve.
+        if (self.selected_preset
+                and self.selected_preset != NONE_PRESET_ID
+                and self.selected_preset not in _get_preset_list()):
+            self.selected_preset = NONE_PRESET_ID
 
-    row = layout.row(align=True)
-    row.operator("xneko.export_prefs", text="Export", icon='EXPORT')
-    row.operator("xneko.import_prefs", text="Import", icon='IMPORT')
-    row.operator("xneko.refresh_presets", text="", icon='FILE_REFRESH')
+        row = layout.row(align=True)
+        row.prop(self, "selected_preset", text="")
 
-    # ---------- Tools ----------
+        has_preset = bool(
+            self.selected_preset
+            and self.selected_preset != NONE_PRESET_ID
+        )
+
+        sub = row.row(align=True)
+        sub.scale_x = 0.45
+        sub.enabled = has_preset
+        sub.operator(
+            "xneko.apply_preset", text="Apply", icon='CHECKMARK',
+        ).preset_name = self.selected_preset
+        sub.operator(
+            "xneko.delete_preset", text="Delete", icon='TRASH',
+        ).preset_name = self.selected_preset
+
+        row = layout.row(align=True)
+        row.operator("xneko.export_prefs", text="Export", icon='EXPORT')
+        row.operator("xneko.import_prefs", text="Import", icon='IMPORT')
+        row.operator("xneko.refresh_presets", text="", icon='FILE_REFRESH')
+
+    # ---------- Tools (collapsible) ----------
     layout.separator()
-    layout.label(text="Tools:")
 
-    groups = {}
-    for item in self.tool_toggles:
-        tool = core._TOOL_REGISTRY.get(item.tool_id)
-        gid = tool["group_id"] if tool else ""
-        groups.setdefault(gid or "(root)", []).append(item)
+    header = layout.row(align=True)
+    arrow = 'TRIA_DOWN' if self.tools_section_expanded else 'TRIA_RIGHT'
+    header.prop(
+        self, "tools_section_expanded",
+        text="", icon=arrow, emboss=False,
+    )
+    header.label(text="Tools:")
 
-    if not groups:
-        layout.label(text="No tools found", icon='INFO')
-    else:
-        if self.active_category not in groups:
-            self.active_category = list(groups.keys())[0]
-
-        all_gids = list(groups.keys())
-        total = len(all_gids)
-
-        usable_px = _get_usable_width(context)
-
-        widest_tab_px = 1
-        for gid in all_gids:
-            display_text = gid.replace(".", " / ").replace("_", " ").title()
-            w = _estimate_tab_px(display_text)
-            if w > widest_tab_px:
-                widest_tab_px = w
-
-        TABS_PER_PAGE = max(1, usable_px // widest_tab_px)
-        if TABS_PER_PAGE > total:
-            TABS_PER_PAGE = total
-
-        page_count = max(1, (total + TABS_PER_PAGE - 1) // TABS_PER_PAGE)
-        if self.tab_page >= page_count:
-            self.tab_page = page_count - 1
-        if self.tab_page < 0:
-            self.tab_page = 0
-
-        start = self.tab_page * TABS_PER_PAGE
-        end = min(start + TABS_PER_PAGE, total)
-        visible_gids = all_gids[start:end]
-
-        tab_row = layout.row(align=True)
-
-        left = tab_row.row(align=True)
-        left.enabled = self.tab_page > 0
-        left.operator(
-            "xneko.shift_tab_page", text="", icon='TRIA_LEFT',
-        ).delta = -1
-
-        for gid in visible_gids:
-            display = gid.replace(".", " / ").replace("_", " ").title()
-            is_active = (self.active_category == gid)
-
-            group_data = core._state.registered_groups.get(gid)
-            icon_info = group_data["icon"] if group_data else None
-
-            icon_name = core._get_group_icon(gid)
-            prefix = ""
-            if icon_info:
-                if icon_info["type"] == "builtin":
-                    icon_name = icon_info["value"]
-                elif icon_info["type"] == "text":
-                    prefix = f"{icon_info['value']} "
-
-            tab_row.operator(
-                "xneko.set_active_category",
-                text=f"{prefix}{display}",
-                icon=icon_name,
-                depress=is_active,
-            ).category = gid
-
-        right = tab_row.row(align=True)
-        right.enabled = self.tab_page < page_count - 1
-        right.operator(
-            "xneko.shift_tab_page", text="", icon='TRIA_RIGHT',
-        ).delta = 1
-
-        main_box = layout.box()
-        for item in groups[self.active_category]:
+    if self.tools_section_expanded:
+        groups = {}
+        for item in self.tool_toggles:
             tool = core._TOOL_REGISTRY.get(item.tool_id)
+            gid = tool["group_id"] if tool else ""
+            groups.setdefault(gid or "(root)", []).append(item)
 
-            if tool and not tool.get("compatible", True):
+        if not groups:
+            layout.label(text="No tools found", icon='INFO')
+        else:
+            if self.active_category not in groups:
+                self.active_category = list(groups.keys())[0]
+
+            all_gids = list(groups.keys())
+            total = len(all_gids)
+
+            usable_px = _get_usable_width(context)
+
+            widest_tab_px = 1
+            for gid in all_gids:
+                display_text = gid.replace(".", " / ").replace("_", " ").title()
+                w = _estimate_tab_px(display_text)
+                if w > widest_tab_px:
+                    widest_tab_px = w
+
+            TABS_PER_PAGE = max(1, usable_px // widest_tab_px)
+            if TABS_PER_PAGE > total:
+                TABS_PER_PAGE = total
+
+            page_count = max(1, (total + TABS_PER_PAGE - 1) // TABS_PER_PAGE)
+            if self.tab_page >= page_count:
+                self.tab_page = page_count - 1
+            if self.tab_page < 0:
+                self.tab_page = 0
+
+            start = self.tab_page * TABS_PER_PAGE
+            end = min(start + TABS_PER_PAGE, total)
+            visible_gids = all_gids[start:end]
+
+            tab_row = layout.row(align=True)
+
+            left = tab_row.row(align=True)
+            left.enabled = self.tab_page > 0
+            left.operator(
+                "xneko.shift_tab_page", text="", icon='TRIA_LEFT',
+            ).delta = -1
+
+            for gid in visible_gids:
+                display = gid.replace(".", " / ").replace("_", " ").title()
+                is_active = (self.active_category == gid)
+
+                group_data = core._state.registered_groups.get(gid)
+                icon_info = group_data["icon"] if group_data else None
+
+                icon_name = core._get_group_icon(gid)
+                prefix = ""
+                if icon_info:
+                    if icon_info["type"] == "builtin":
+                        icon_name = icon_info["value"]
+                    elif icon_info["type"] == "text":
+                        prefix = f"{icon_info['value']} "
+
+                tab_row.operator(
+                    "xneko.set_active_category",
+                    text=f"{prefix}{display}",
+                    icon=icon_name,
+                    depress=is_active,
+                ).category = gid
+
+            right = tab_row.row(align=True)
+            right.enabled = self.tab_page < page_count - 1
+            right.operator(
+                "xneko.shift_tab_page", text="", icon='TRIA_RIGHT',
+            ).delta = 1
+
+            main_box = layout.box()
+            for item in groups[self.active_category]:
+                tool = core._TOOL_REGISTRY.get(item.tool_id)
+
+                if tool and not tool.get("compatible", True):
+                    row = main_box.row(align=True)
+                    row.enabled = False
+                    row.label(text="", icon='BLANK1')
+                    row.prop(item, "enabled", text=item.display_name)
+                    warn = main_box.row()
+                    warn.alert = True
+                    warn.label(text=tool["incompatible_reason"], icon='ERROR')
+                    continue
+
+                has_props = bool(tool.get("preference_props")) if tool else False
+                has_draw = callable(tool.get("draw_preferences")) if tool else False
+                can_expand = (
+                    tool is not None
+                    and item.enabled
+                    and tool.get("preferences_in_addon") is not False
+                    and (has_props or has_draw)
+                )
+
                 row = main_box.row(align=True)
-                row.enabled = False
-                row.label(text="", icon='BLANK1')
+                if can_expand:
+                    arrow = 'TRIA_DOWN' if item.expanded else 'TRIA_RIGHT'
+                    row.prop(item, "expanded", text="", icon=arrow, emboss=False)
+                else:
+                    row.label(text="", icon='BLANK1')
                 row.prop(item, "enabled", text=item.display_name)
-                warn = main_box.row()
-                warn.alert = True
-                warn.label(text=tool["incompatible_reason"], icon='ERROR')
-                continue
 
-            has_props = bool(tool.get("preference_props")) if tool else False
-            has_draw = callable(tool.get("draw_preferences")) if tool else False
-            can_expand = (
-                tool is not None
-                and item.enabled
-                and tool.get("preferences_in_addon") is not False
-                and (has_props or has_draw)
-            )
+                if not can_expand or not item.expanded:
+                    continue
 
-            row = main_box.row(align=True)
-            if can_expand:
-                arrow = 'TRIA_DOWN' if item.expanded else 'TRIA_RIGHT'
-                row.prop(item, "expanded", text="", icon=arrow, emboss=False)
-            else:
-                row.label(text="", icon='BLANK1')
-            row.prop(item, "enabled", text=item.display_name)
+                ns = _make_tool_namespace(tool)
+                if ns is None:
+                    continue
 
-            if not can_expand or not item.expanded:
-                continue
+                sub_box = main_box.box()
+                if has_draw:
+                    try:
+                        tool["draw_preferences"](sub_box, context, ns)
+                    except Exception as e:
+                        sub_box.label(text=f"Prefs error: {e}", icon='ERROR')
+                else:
+                    for name in tool["preference_props"]:
+                        ns.prop(sub_box, name)
 
-            ns = _make_tool_namespace(tool)
-            if ns is None:
-                continue
-
-            sub_box = main_box.box()
-            if has_draw:
-                try:
-                    tool["draw_preferences"](sub_box, context, ns)
-                except Exception as e:
-                    sub_box.label(text=f"Prefs error: {e}", icon='ERROR')
-            else:
-                for name in tool["preference_props"]:
-                    ns.prop(sub_box, name)
-
-
-    # ---------- Diagnostics (collapsed by default) ----------
+    # ---------- Diagnostics (collapsible) ----------
     layout.separator()
 
     header = layout.row(align=True)
@@ -1105,20 +1132,49 @@ def _draw_preferences(self, context):
             "xneko.clear_critical_reports", text="Clear", icon='TRASH',
         )
 
-    # ---------- Links ----------
+    # ---------- Links (collapsible) ----------
     layout.separator()
-    layout.label(text="Links:", icon='BOOKMARKS')
 
-    by_author = {}
-    for label, url, icon, author in LINKS:
-        by_author.setdefault(author, []).append((label, url, icon))
+    header = layout.row(align=True)
+    arrow = 'TRIA_DOWN' if self.links_section_expanded else 'TRIA_RIGHT'
+    header.prop(
+        self, "links_section_expanded",
+        text="", icon=arrow, emboss=False,
+    )
+    header.label(text="Links:", icon='BOOKMARKS')
 
-    for author, items in by_author.items():
-        box = layout.box()
-        box.label(text=author, icon='USER')
-        grid = box.grid_flow(row_major=True, columns=2, even_columns=True)
-        for label, url, icon in items:
-            grid.operator("wm.url_open", text=label, icon=icon).url = url
+    if self.links_section_expanded:
+        by_author = {}
+        for label, url, icon, author in LINKS:
+            by_author.setdefault(author, []).append((label, url, icon))
+
+        for author, items in by_author.items():
+            box = layout.box()
+            box.label(text=author, icon='USER')
+            grid = box.grid_flow(row_major=True, columns=2, even_columns=True)
+            for label, url, icon in items:
+                # Image path -> icon_value (preview icon_id)
+                if icon_store.is_image_path(icon):
+                    icon_id = icon_store.get_icon_id(icon)
+                    if icon_id:
+                        grid.operator(
+                            "wm.url_open", text=label, icon_value=icon_id,
+                        ).url = url
+                    else:
+                        # Image failed to load; fall back to no icon.
+                        grid.operator(
+                            "wm.url_open", text=label,
+                        ).url = url
+                # Built-in icon name
+                elif icon:
+                    grid.operator(
+                        "wm.url_open", text=label, icon=icon,
+                    ).url = url
+                # No icon
+                else:
+                    grid.operator(
+                        "wm.url_open", text=label,
+                    ).url = url
 
 
 # ==================================================
@@ -1149,6 +1205,13 @@ def build_preferences_class(include_tool_props=True):
         "tool_toggles": CollectionProperty(type=XNekoToolToggle),
 
         "project_section_expanded": BoolProperty(default=False),
+
+        # Collapse states for the other preference sections. Defaults:
+        # Presets and Tools are always-open (used constantly), Links is
+        # collapsed (rarely needed after first look).
+        "presets_section_expanded": BoolProperty(default=False),
+        "tools_section_expanded": BoolProperty(default=False),
+        "links_section_expanded": BoolProperty(default=False),
 
         "save_to_project": BoolProperty(
             name="Save Preferences to .blend",
