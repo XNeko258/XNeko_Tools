@@ -14,6 +14,15 @@ blender_version_min = (4, 0, 0)
 
 
 # ============================================================
+# Constants
+# ============================================================
+# Bones shorter than this are skipped: below it Blender itself
+# degenerates the bone (it disappears in Object mode) and any
+# rotation math becomes meaningless or unstable.
+MIN_BONE_LENGTH = 1e-5
+
+
+# ============================================================
 # Enum items
 # ============================================================
 _ORIENT_ITEMS = [
@@ -28,9 +37,12 @@ _AXIS_ITEMS = [
 ]
 
 _PIVOT_ITEMS = [
-    ('HEAD',   "Bone Origin", "Rotate around each bone's head"),
-    ('TAIL',   "Bone Tail",   "Rotate around each bone's tail"),
-    ('CENTER', "Bone Center", "Rotate around each bone's center"),
+    ('HEAD',   "Bone Origin",
+     "Each selected bone pivots around its own head"),
+    ('TAIL',   "Bone Tail",
+     "Each selected bone pivots around its own tail"),
+    ('CENTER', "Bone Center",
+     "Each selected bone pivots around its own center"),
 ]
 
 _WORLD_AXES = {
@@ -38,6 +50,19 @@ _WORLD_AXES = {
     'Y': Vector((0.0, 1.0, 0.0)),
     'Z': Vector((0.0, 0.0, 1.0)),
 }
+
+
+# ============================================================
+# Module-level state
+# ------------------------------------------------------------
+# Remembers the user's GLOBAL pivot choice while the space is set
+# to NORMAL. Kept as a module variable rather than a PropertyGroup
+# field: it does not need to be exposed to RNA, does not
+# participate in undo, and avoids introducing a new field into
+# the PropertyGroup whose registration can interact badly with
+# hot-reloading the addon.
+# ============================================================
+_GLOBAL_PIVOT_MEMORY = "HEAD"
 
 
 # ============================================================
@@ -50,6 +75,9 @@ def _bone_local_axes(eb):
     """
     y_vec = eb.tail - eb.head
     if y_vec.length < 1e-10:
+        # Degenerate bone (head == tail). Fall back to the global
+        # +Y direction so downstream math still produces a valid
+        # orthonormal frame instead of a zero vector.
         y_vec = Vector((0.0, 1.0, 0.0))
     else:
         y_vec = y_vec.normalized()
@@ -76,16 +104,43 @@ def _bone_local_axes(eb):
     return x_vec, y_vec, z_vec
 
 
+def _count_skipped(edit_bones):
+    """Count selected bones whose length is below MIN_BONE_LENGTH."""
+    n = 0
+    for eb in edit_bones:
+        if eb.select and eb.length < MIN_BONE_LENGTH:
+            n += 1
+    return n
+
+
 # ============================================================
 # UI PropertyGroup
 # ------------------------------------------------------------
-# All settings persist per scene. The PropertyGroup itself is the
-# source of truth -- no shadow copy in a module-level dict.
+# Stored on WindowManager, not Scene, so the values are NOT part
+# of Blender's undo system. Ctrl+Z after a rotation reverts only
+# the bone transforms; the panel settings stay as the user last
+# set them.
 # ============================================================
 def _on_orientation_change(self, context):
-    # NORMAL space requires pivot == HEAD
-    if self.orientation == 'NORMAL' and self.pivot != 'HEAD':
-        self.pivot = 'HEAD'
+    global _GLOBAL_PIVOT_MEMORY
+    # NORMAL space forces pivot to HEAD. Stash the user's GLOBAL
+    # pivot choice first so it can be restored when they switch back.
+    if self.orientation == 'NORMAL':
+        if self.pivot != 'HEAD':
+            _GLOBAL_PIVOT_MEMORY = self.pivot
+            self.pivot = 'HEAD'
+    else:  # GLOBAL
+        if _GLOBAL_PIVOT_MEMORY and _GLOBAL_PIVOT_MEMORY != 'HEAD':
+            self.pivot = _GLOBAL_PIVOT_MEMORY
+
+
+def _on_pivot_change(self, context):
+    global _GLOBAL_PIVOT_MEMORY
+    # Only remember manual pivot choices made while in GLOBAL space.
+    # NORMAL forcibly overwrites pivot to HEAD, and that internal
+    # write must not clobber the user's stored preference.
+    if self.orientation == 'GLOBAL':
+        _GLOBAL_PIVOT_MEMORY = self.pivot
 
 
 class XNEKO_QuickRotateUI(bpy.types.PropertyGroup):
@@ -104,6 +159,7 @@ class XNEKO_QuickRotateUI(bpy.types.PropertyGroup):
         name="Pivot",
         items=_PIVOT_ITEMS,
         default='HEAD',
+        update=_on_pivot_change,
     )
     angle: FloatProperty(
         name="Angle",
@@ -149,7 +205,7 @@ class XNEKO_OT_quick_rotate(bpy.types.Operator):
             self.report({'ERROR'}, "Please select an armature object")
             return {'CANCELLED'}
 
-        ui = context.scene.xneko_quick_rotate_ui
+        ui = context.window_manager.xneko_quick_rotate_ui
         mode = context.mode
         return_to_pose = ui.return_to_pose
 
@@ -186,21 +242,29 @@ class XNEKO_OT_quick_rotate(bpy.types.Operator):
         if orient == 'NORMAL':
             pivot_mode = 'HEAD'
 
+        skipped = _count_skipped(obj.data.edit_bones)
+
         # ------------------------------------------------------------
         # NORMAL + Y: pure roll adjustment
         # ------------------------------------------------------------
         if orient == 'NORMAL' and axis == 'Y':
             count = 0
             for eb in obj.data.edit_bones:
-                if eb.select:
-                    eb.roll += angle_rad
-                    count += 1
+                if not eb.select:
+                    continue
+                if eb.length < MIN_BONE_LENGTH:
+                    continue
+                eb.roll += angle_rad
+                count += 1
             obj.data.update_tag()
-            self.report(
-                {'INFO'},
+
+            msg = (
                 f"Adjusted Roll of {count} bone(s) "
-                f"by {ui.angle} degrees",
+                f"by {ui.angle} degrees"
             )
+            if skipped:
+                msg += f" ({skipped} too short, skipped)"
+            self.report({'INFO'}, msg)
 
         # ------------------------------------------------------------
         # General case: rotate heads/tails around the pivot
@@ -211,6 +275,8 @@ class XNEKO_OT_quick_rotate(bpy.types.Operator):
 
             for eb in obj.data.edit_bones:
                 if not eb.select:
+                    continue
+                if eb.length < MIN_BONE_LENGTH:
                     continue
 
                 head_a = eb.head.copy()
@@ -248,11 +314,14 @@ class XNEKO_OT_quick_rotate(bpy.types.Operator):
                 count += 1
 
             obj.data.update_tag()
-            self.report(
-                {'INFO'},
+
+            msg = (
                 f"Rotated {count} bone(s) around {axis} "
-                f"by {ui.angle} degrees",
+                f"by {ui.angle} degrees"
             )
+            if skipped:
+                msg += f" ({skipped} too short, skipped)"
+            self.report({'INFO'}, msg)
 
         if return_to_pose:
             try:
@@ -296,7 +365,7 @@ class VIEW3D_PT_xneko_quick_rotate(bpy.types.Panel):
             box.label(text="Use in Pose or Edit mode", icon='INFO')
             return
 
-        ui = context.scene.xneko_quick_rotate_ui
+        ui = context.window_manager.xneko_quick_rotate_ui
 
         col = layout.column(align=True)
         col.prop(ui, "orientation")
@@ -309,6 +378,16 @@ class VIEW3D_PT_xneko_quick_rotate(bpy.types.Panel):
 
         col.prop(ui, "angle", text="Angle")
         col.prop(ui, "return_to_pose")
+
+        # Warn about too-short bones in the current selection.
+        skipped = _count_skipped(obj.data.edit_bones)
+        if skipped:
+            warn = layout.box()
+            warn.alert = True
+            warn.label(
+                text=f"{skipped} bone(s) too short, will be skipped",
+                icon='ERROR',
+            )
 
         layout.separator()
         layout.operator(
@@ -326,8 +405,29 @@ classes = (
     VIEW3D_PT_xneko_quick_rotate,
 )
 
-scene_props = {
-    "xneko_quick_rotate_ui": bpy.props.PointerProperty(
-        type=XNEKO_QuickRotateUI,
-    ),
-}
+
+def on_load():
+    """Attach the UI PropertyGroup to WindowManager.
+
+    WindowManager is not part of the undo system, so values stored
+    here are unaffected by Ctrl+Z. Always rebinds so a stale
+    PointerProperty left over from a previous module version is
+    replaced with one that points to the current class.
+    """
+    if hasattr(bpy.types.WindowManager, "xneko_quick_rotate_ui"):
+        try:
+            del bpy.types.WindowManager.xneko_quick_rotate_ui
+        except Exception:
+            pass
+    bpy.types.WindowManager.xneko_quick_rotate_ui = (
+        bpy.props.PointerProperty(type=XNEKO_QuickRotateUI)
+    )
+
+
+def on_unload():
+    """Detach the UI PropertyGroup from WindowManager."""
+    if hasattr(bpy.types.WindowManager, "xneko_quick_rotate_ui"):
+        try:
+            del bpy.types.WindowManager.xneko_quick_rotate_ui
+        except Exception:
+            pass
