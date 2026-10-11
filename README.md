@@ -93,6 +93,8 @@ cause and fix.
 - [Group Folder Guide](docs/GROUPS.md) — how group folders are named,
   how group icons are resolved, and how presets interact with group
   structure.
+- [Tool Reference](docs/TOOLS.md) — why each bundled tool exists and
+  what it does.
 
 ## Project Structure
 
