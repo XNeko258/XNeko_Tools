@@ -4,7 +4,7 @@
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 8, 5),
+    "version": (0, 9, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (
@@ -24,34 +24,6 @@ import bpy
 from . import core
 from . import preferences
 from .common import error_reports as _reports
-
-
-def _register_preference_classes():
-    for tool in core._TOOL_REGISTRY.values():
-        for cls in tool.get("preference_classes", ()):
-            if not isinstance(cls, type):
-                continue
-            try:
-                bpy.utils.register_class(cls)
-            except Exception as e:
-                print(
-                    f"[XNeko] preference class {cls.__name__} failed: {e}"
-                )
-                _reports.report_tool_error(
-                    f"preference class failed: {cls.__name__}",
-                    exc=e,
-                )
-
-
-def _unregister_preference_classes():
-    for tool in reversed(list(core._TOOL_REGISTRY.values())):
-        for cls in reversed(tool.get("preference_classes", ())):
-            if not isinstance(cls, type):
-                continue
-            try:
-                bpy.utils.unregister_class(cls)
-            except Exception:
-                pass
 
 
 def register():
@@ -75,7 +47,7 @@ def _register_impl():
     core._initialize_tools()
 
     # ---- 2. Tool-owned PropertyGroups used by preferences ----
-    _register_preference_classes()
+    preferences.register_tool_preference_classes()
 
     # ---- 3. Base operator / property classes ----
     bpy.utils.register_class(preferences.XNEKO_OT_set_active_category)
@@ -100,6 +72,10 @@ def _register_impl():
             exc=e,
             extra={"fallback": "include_tool_props=False"},
         )
+        # The fallback rebuild resets every tool's _pref_names to {}.
+        # Any invalid_pref_prop issue recorded by the first pass stays
+        # in core._state.registration_issues on purpose: the UI should
+        # still surface it so the author can fix the offending prop.
         preferences.XNekoPreferences = (
             preferences.build_preferences_class(include_tool_props=False)
         )
@@ -227,7 +203,7 @@ def unregister():
     bpy.utils.unregister_class(preferences.XNEKO_OT_set_active_category)
 
     # ---- 6. Preference helper PropertyGroups ----
-    _unregister_preference_classes()
+    preferences.unregister_tool_preference_classes()
 
     # ---- 7. Clear plugin state ----
     core._state.clear()

@@ -238,10 +238,16 @@ def import_prefs(prefs_obj, core, data, only_tools=None):
         target = bool(saved_entry.get("__enabled__", True))
 
         item = toggles.get(full_id)
-        if item is not None and item.enabled != target:
-            item.enabled = target
-        else:
+        if item is None:
+            # No toggle row for this tool (e.g. a stale preset entry
+            # for a tool that just disappeared). Fall back to a direct
+            # call so state stays consistent when possible.
             _set_tool_enabled(core, full_id, target)
+        elif item.enabled != target:
+            # Assigning .enabled fires the update callback, which
+            # routes through _set_tool_enabled itself.
+            item.enabled = target
+        # else: already at the target value, nothing to do.
 
         values = saved_entry.get("preferences")
         if values:

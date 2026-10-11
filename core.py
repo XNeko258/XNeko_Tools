@@ -54,9 +54,6 @@ class PluginState:
 
         self.icon_previews = bpy.utils.previews.new()
 
-        for group_data in self.registered_groups.values():
-            group_data["icon"] = None
-
     def clear(self):
         if self.icon_previews is not None:
             try:
@@ -344,29 +341,6 @@ def discover_tools(package_name, package_path):
             )
             continue
 
-            # The import traceback already contains the failing line
-            # inside the tool module. Extract it so the report can
-            # point straight at it.
-            failed_file = None
-            failed_line = None
-            tb = getattr(e, "__traceback__", None)
-            while tb is not None:
-                fname = tb.tb_frame.f_code.co_filename
-                if os.path.isfile(fname) and package_path[0] in fname:
-                    failed_file = fname
-                    failed_line = tb.tb_lineno
-                tb = tb.tb_next
-
-            _reports.report_tool_error(
-                "tool module import failed",
-                exc=e,
-                extra={
-                    "module": info.name,
-                    "file": failed_file or info.name,
-                    "line": failed_line,
-                },
-            )
-            continue
 
         classes = getattr(module, "classes", None)
         if not classes:
@@ -593,7 +567,14 @@ def register_tool_module(module, registry):
         if existing.get("tool_id") == tool_id:
             return False, REGISTRATION_DUPLICATE_TOOL_ID
 
-    rel_parts = module_name.split(".")
+    package_name = __package__
+    prefix = f"{package_name}."
+    rel = (
+        module_name[len(prefix):]
+        if module_name.startswith(prefix)
+        else module_name
+    )
+    rel_parts = rel.split(".")
     dir_parts = rel_parts[:-1]
     if dir_parts and dir_parts[0] == "tools":
         group_id = ".".join(dir_parts[1:])
@@ -776,20 +757,6 @@ def _initialize_tools():
     build_group_registry(groups, _state.registered_groups)
 
     return issues
-
-
-def rescan_tools():
-    _state.reset_previews()
-    _initialize_tools()
-
-    # Allow critical errors to be re-logged after a rescan.
-    _reports.reset_dedup()
-
-    try:
-        prefs = bpy.context.preferences.addons[__package__].preferences
-        prefs.registration_issues = json.dumps(_state.registration_issues)
-    except Exception:
-        pass
 
 
 # ============================================================

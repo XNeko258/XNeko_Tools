@@ -40,8 +40,9 @@ FILE_SUFFIX = ".log"
 
 
 # Deduplicates critical reports within a Blender session. Cleared
-# by reset_dedup() (called from core.rescan_tools) so that the
-# next discovery pass can log again if the same failure recurs.
+# by reset_dedup() (called from preferences.hot_reload_tools) so
+# that the next discovery pass can log again if the same failure
+# recurs.
 _critical_dedup = set()
 
 

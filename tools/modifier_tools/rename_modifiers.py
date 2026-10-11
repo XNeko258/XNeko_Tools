@@ -120,6 +120,69 @@ class XNEKO_ModPref(bpy.types.PropertyGroup):
     )
 
 
+def _get_selected_pose_bones(context):
+    """Return the set of selected pose bones, or None when not in Pose Mode.
+
+    None  -> no filter (process all bones)
+    set() -> Pose Mode, nothing selected (process no bones)
+    """
+    try:
+        if context.mode == 'POSE':
+            selected_objs = set(context.selected_objects)
+            return {
+                pb for pb in (context.selected_pose_bones or [])
+                if pb.id_data in selected_objs
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _get_selected_pose_bones(context):
+    """Return selected pose bones, or None when not in Pose Mode.
+
+    None  -> no filter (process every bone)
+    set() -> Pose Mode with no bone selected (process no bone constraints)
+    """
+    try:
+        if context.mode == 'POSE':
+            selected_objs = set(context.selected_objects)
+            return {
+                pb for pb in (context.selected_pose_bones or [])
+                if pb.id_data in selected_objs
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _get_selected_pose_bones(context, mode='ALL'):
+    """Decide which pose bones to filter by.
+
+    Returns None  -> no filter (process every pose bone of the armature)
+    Returns set() -> only process pose bones in this set
+
+    mode == 'ALL'      : always None
+    mode == 'SELECTED' : Pose Mode -> selected bones;
+                         otherwise  -> None (fall back to all)
+    """
+    if mode != 'SELECTED':
+        return None
+
+    if context.mode != 'POSE':
+        # Not in Pose Mode: no bone-level selection concept, fall back to all
+        return None
+
+    try:
+        selected_objs = set(context.selected_objects)
+        return {
+            pb for pb in (context.selected_pose_bones or [])
+            if pb.id_data in selected_objs
+        }
+    except Exception:
+        return None
+
+
 # ============================================================
 # Scan helpers
 # ============================================================
