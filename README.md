@@ -20,7 +20,7 @@ tool modules, not just consume a fixed tool set.
 - Required `tool_id` per module, with collision detection and a visible
   registration issue panel.
 - Per-tool preference properties with optional custom UI.
-- Preset system (format v2): export, import, and apply JSON presets.
+- Preset system: export, import, and apply JSON presets.
 - Per-tool `preference_props` values are captured by presets.
   `scene_props` values are never touched by presets.
 - Project preferences: save and apply preference state inside `.blend`
@@ -29,9 +29,14 @@ tool modules, not just consume a fixed tool set.
   (emoji / kaomoji).
 - Blender version compatibility checks per tool.
 - Lifecycle hooks for timers, handlers, and cleanup.
-- `Rescan Tools` button for refreshing discovery without restarting
-  Blender.
-- Optional registration debug log, written inside the add-on folder.
+- `Hot Reload Tools` button: reloads tool modules from disk, rebuilds
+  the dynamic preferences class, and preserves the current UI and
+  enabled state. Editing a tool's `.py` file no longer requires a
+  restart.
+- Automatic session persistence: tool enable flags and per-tool
+  preference values survive restarts without a manual save.
+- Two-channel error reporting: optional tool reports in
+  `logs/reports/`, always-on critical reports in `logs/critical/`.
 - Shared code under `common/` for cross-tool utilities.
 
 ## Requirements
@@ -60,8 +65,9 @@ tool modules, not just consume a fixed tool set.
 3. Restart Blender.
 4. Enable `XNeko Tools` in `Edit > Preferences > Add-ons`.
 
-> Cold restart Blender after changing add-on code. Reloading scripts with
-> `F8` is not enough for module changes.
+> Cold restart Blender after changing framework code (`core.py`,
+> `preferences.py`, `common/*`). Edits under `tools/` can be applied
+> with `Hot Reload Tools`.
 
 ## Quick Start
 
@@ -79,8 +85,8 @@ cause and fix.
 ## Documentation
 
 - [Development Guide](docs/DEVELOPMENT.md) — how to write tool modules,
-  metadata fields, `tool_id` rules, group icons, logging, and version
-  compatibility.
+  metadata fields, `tool_id` rules, group icons, error reporting, and
+  version compatibility.
 - [Preset Guide](docs/PRESETS.md) — how to export, import, and apply
   presets, how preference values are captured, and how project-embedded
   preferences work.
@@ -97,11 +103,15 @@ XNeko_Tools/
 ├── preferences.py
 ├── common/
 │   ├── __init__.py
+│   ├── error_reports.py
+│   ├── icon_store.py
 │   ├── prefs_io.py
-│   └── preset_store.py
-├── logs/                       ← created on first debug log write
-│   └── xneko_tools.log
-├── presets/
+│   ├── preset_store.py
+│   └── session_store.py
+├── logs/                       ← created on first report write
+│   ├── reports/
+│   └── critical/
+├── presets/                    ← legacy, read-only
 │   └── *.json
 └── tools/
     ├── mesh_tools/
@@ -150,8 +160,9 @@ classes = (
 )
 ```
 
-Save the file under `tools/<group>/<tool_name>.py`, then cold restart
-Blender. The tool appears in the N-panel.
+Save the file under `tools/<group>/<tool_name>.py`, then either cold
+restart Blender or click `Hot Reload Tools` in the add-on preferences.
+The tool appears in the N-panel.
 
 `tool_id` is required. Modules without it are skipped and reported.
 
@@ -169,8 +180,17 @@ capture, per tool:
 Presets never touch `scene_props`. Those describe the current operation
 and are tied to the project, not the user's configuration.
 
-Presets are stored in `XNeko_Tools/presets/` when the add-on folder is
-writable, otherwise they fall back to Blender's user presets directory.
+New presets are always written to Blender's user preset directory:
+
+| System  | Path |
+| ------- | ---- |
+| Windows | `%APPDATA%\Blender Foundation\Blender\4.x\scripts\presets\XNeko_Tools\` |
+| Linux   | `~/.config/blender/4.x/scripts/presets/XNeko_Tools/` |
+| macOS   | `~/Library/Application Support/Blender/4.x/scripts/presets/XNeko_Tools/` |
+
+The add-on's own `presets/` folder is still scanned as a legacy
+source, so presets written by earlier versions remain readable and
+deletable. New presets are never written there.
 
 Use the `Presets:` section in `Edit > Preferences > Add-ons > XNeko Tools`
 to export, import, apply, delete, or refresh presets.
@@ -191,20 +211,39 @@ Project preferences have the highest priority when enabled. Only
 `preference_props` values are stored; `scene_props` remain per-scene as
 usual.
 
-## Debug Logging
+## Session State
 
-Registration issues are printed to the console unconditionally. A
-persistent log file is only written when the `Registration Debug Log`
-toggle is enabled in the add-on preferences.
+Tool enable flags and per-tool preference values are written
+automatically to a session file under the user config directory:
 
-When enabled, the log is written to:
+    <config>/xneko_tools/session.json
 
-- `<addon>/logs/xneko_tools.log` when the add-on folder is writable
-- otherwise, the user's Blender config directory under
-  `xneko_tools/logs/`
+This happens on every toggle change and every preference edit. On
+startup, the session state is applied after defaults and before
+project preferences. You do not need to save preferences manually
+for tool state to survive a restart.
 
-The log file is truncated when it exceeds 1 MB. Use the `Open Log Folder`
-button in the add-on preferences to open the directory directly.
+The session file is overwritten on the next state change. To clear
+it entirely, delete the file.
+
+## Error Reporting
+
+Two channels:
+
+- **Tool Reports** — optional. Written to `logs/reports/` when
+  `Enable Error Reporting` is on in the add-on preferences. Covers
+  tool-module failures: import errors, invalid declarations, dropped
+  preference properties, panel attach errors.
+- **Critical Reports** — always on. Written to `logs/critical/`.
+  Reserved for the add-on's own infrastructure failures. Cannot be
+  disabled; the user toggle never suppresses them.
+
+Each directory keeps the newest 10 files. The add-on folder is used
+when writable; otherwise the log root falls back to the user config
+directory under `xneko_tools/logs/`.
+
+Use `Open Tool Reports` / `Open Critical Reports` in the add-on
+preferences to open either folder, and `Clear` to empty it.
 
 ## Compatibility
 

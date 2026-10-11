@@ -27,17 +27,7 @@ renamed on disk.
 
 ## 2. Preset Locations
 
-### User presets
-
-Written to the add-on folder when it is writable:
-
-```text
-XNeko_Tools/presets/*.json
-```
-
-If the add-on is installed from a read-only location (for example, an
-extension platform), the add-on falls back to Blender's user resource
-directory:
+New presets are always written to Blender's user preset directory:
 
 | System  | Path |
 | ------- | ---- |
@@ -45,17 +35,17 @@ directory:
 | Linux   | `~/.config/blender/4.x/scripts/presets/XNeko_Tools/` |
 | macOS   | `~/Library/Application Support/Blender/4.x/scripts/presets/XNeko_Tools/` |
 
-### Built-in presets
-
-Built-in presets live in `XNeko_Tools/presets/*.json` and ship with the
-add-on. Users can see and apply them. Manage them through git.
-
 To check the directory currently in use:
 
 ```python
 from XNeko_Tools.common import preset_store
 print(preset_store.get_preset_dir())
 ```
+
+### Built-in presets
+
+Built-in presets live in `XNeko_Tools/presets/*.json` and ship with the
+add-on. Users can see and apply them. Manage them through git.
 
 ---
 
@@ -66,7 +56,7 @@ print(preset_store.get_preset_dir())
   "format": "xneko_prefs",
   "version": 2,
   "name": "Rigging",
-  "plugin_version": "0.7.0",
+  "plugin_version": "0.9.0",
   "blender_version": "4.2.0",
   "tools": {
     "clean_groups": {
@@ -152,7 +142,7 @@ The export includes the enabled state and the values of
 
 ```text
 Preset: Rigging
-Plugin: 0.7.0      Blender: 4.2.0
+Plugin: 0.9.0      Blender: 4.2.0
 
 Select modules to apply:
   [✓] Clean Vertex Groups     → enable
@@ -310,8 +300,10 @@ A: Enable **Use Project Preferences**, open the file, click the 🗑 next
 to `Project File:`, then save the `.blend`.
 
 **Q: Will presets be lost when the add-on is updated?**
-A: Presets stored in `XNeko_Tools/presets/` can be lost if the add-on
-folder is replaced. Export important presets elsewhere as a backup.
+A: No. New presets are written to Blender's user preset directory
+and survive add-on updates. Presets under `XNeko_Tools/presets/` are
+legacy and read-only — if you have any there, copy them elsewhere
+before reinstalling.
 
 ---
 

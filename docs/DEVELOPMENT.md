@@ -90,7 +90,8 @@ classes = (
 )
 ```
 
-Save the file, then cold restart Blender. The tool appears in the
+Save the file, then either cold restart Blender or click
+`Hot Reload Tools` in the add-on preferences. The tool appears in the
 N-panel.
 
 > **Do not set `bl_category` or `bl_parent_id` manually.** The framework
@@ -218,7 +219,7 @@ def _get_prefs():
         mod = importlib.import_module(top + ".preferences")
     except ImportError:
         return None
-    return mod.get_tool_prefs(__name__)
+    return mod.get_tool_prefs(tool_id)   # tool_id, not __name__
 
 
 prefs = _get_prefs()
@@ -454,37 +455,54 @@ shows a red warning listing the cause and the file path:
 The N-panel shows a compact warning when issues exist. Open the add-on
 preferences for details.
 
-Registration issues are detected once when the add-on is enabled. After
-editing tool files, use the `Rescan Tools` button to refresh.
+Registration issues are detected once when the add-on is enabled.
+After editing tool files, use the `Hot Reload Tools` button to
+refresh.
 
 ---
 
-## 15. Rescan
+## 15. Hot Reload
 
-The `Rescan Tools` button in the add-on preferences re-runs discovery
-and icon resolution, and refreshes the registration issue panel.
+The `Hot Reload Tools` button in the add-on preferences:
 
-`Rescan Tools` **does not reimport already loaded Python modules.** If
-you change a `classes` tuple or add a new Blender class inside an
-already-loaded tool file, cold restart Blender to pick up the change.
+- drops every `tools/` submodule from `sys.modules` and re-imports
+  from disk
+- unloads every loaded tool, re-runs discovery, re-registers
+  operators and panels
+- rebuilds the dynamic `XNekoPreferences` class, so newly added or
+  removed `preference_props` take effect
+- re-applies the current UI state and tool enable flags
+
+Use it after editing a file under `tools/`. It covers:
+
+- adding a new tool module
+- deleting a tool module
+- changing a `tool_id`
+- editing an operator, panel, or preference property
+
+It does **not** cover changes to the framework itself
+(`core.py`, `preferences.py`, `common/*`). Those require a cold
+restart.
+
+If a tool module has a syntax error or raises on import, the tool is
+skipped and reported; the rest of the add-on stays functional.
 
 ---
 
-## 16. Debug Logging
+## 16. Error Reporting
 
-Registration debug logging is off by default. Enable it with the
-`Registration Debug Log` toggle in the add-on preferences.
+Two channels, described in detail in the README:
 
-When enabled, the log is written to:
+- Tool reports (`logs/reports/`) — gated on
+  `Enable Error Reporting`. This is where a tool module's own
+  failures end up.
+- Critical reports (`logs/critical/`) — always written, regardless
+  of user preference. Reserved for framework failures.
 
-- `<addon>/logs/xneko_tools.log` when the add-on folder is writable
-- otherwise, the user config directory under `xneko_tools/logs/`
-
-The log file is truncated when it exceeds 1 MB. Use the `Open Log Folder`
-button in the add-on preferences to open the directory directly.
-
-Console output for registration issues is always printed, regardless of
-this toggle.
+If you are iterating on a tool and want its errors captured to disk,
+enable `Enable Error Reporting` in the add-on preferences before
+running `Hot Reload Tools`. Registration issues are always printed
+to the console regardless of this toggle.
 
 ---
 
@@ -497,7 +515,7 @@ this toggle.
 | Panel appears at the top level instead of under its group | Did you set `bl_parent_id` / `bl_category` manually? |
 | Preference widget does not appear | Did you use `layout.prop(prefs, ...)` instead of `prefs.prop(layout, ...)`? |
 | Button should be greyed out but is not | Check the conditions under which `poll` returns `False`. |
-| Code changes do not take effect | Cold restart Blender, or use `Rescan Tools` for file-level changes only. |
+| Code changes do not take effect | Cold restart Blender for framework changes, or use `Hot Reload Tools` for edits under `tools/`. |
 | Preset does not affect a tool | Is the tool installed, compatible, and checked in the Apply dialog? |
 | Group icon shows the wrong icon | Check the `group_icon` value and its resolution order in `docs/GROUPS.md`. |
 
