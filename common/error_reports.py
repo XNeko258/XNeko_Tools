@@ -27,6 +27,9 @@ import datetime
 import bpy
 
 
+__xneko_framework__ = True
+
+
 # ------------------------------------------------------------
 # Layout
 # ------------------------------------------------------------
@@ -188,8 +191,12 @@ def _write_report(folder, prefix, label, exc, extra, forced):
 
     now = datetime.datetime.now()
     stamp = now.strftime("%Y%m%d_%H%M%S")
-    filename = f"{prefix}{stamp}{FILE_SUFFIX}"
-    path = os.path.join(folder, filename)
+    base = f"{prefix}{stamp}"
+    path = os.path.join(folder, base + FILE_SUFFIX)
+    n = 1
+    while os.path.exists(path):
+        path = os.path.join(folder, f"{base}_{n}{FILE_SUFFIX}")
+        n += 1
 
     tag = "CRITICAL" if forced else "TOOL"
     sep = "=" * 72
@@ -306,6 +313,12 @@ def flush_pending():
         return
     state = is_user_reporting_enabled()
     if not state:
+        n = len(_pending_reports)
+        if n:
+            print(
+                f"[XNeko] discarding {n} pending tool report(s): "
+                f"Enable Error Reporting is off"
+            )
         _pending_reports.clear()
         return
     for label, exc, extra in _pending_reports:

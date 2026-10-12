@@ -16,6 +16,9 @@ from .common import error_reports as _reports
 from .common import icon_store
 
 
+__xneko_framework__ = True
+
+
 def _is_property_like(value):
     """Best-effort check that `value` is a bpy.props.* property.
 
@@ -93,14 +96,47 @@ _ACTIVE_APPLY_OP = None
 # This makes the state survive Blender restarts without relying on
 # the user explicitly saving preferences.
 # ==================================================
-_suppress_session_write = False
-_suppress_toggle_load = False
+_suppress_session_write = 0
+
+
+def _push_suppress_session():
+    global _suppress_session_write
+    _suppress_session_write += 1
+
+
+def _pop_suppress_session():
+    global _suppress_session_write
+    if _suppress_session_write > 0:
+        _suppress_session_write -= 1
+
+
+_session_dirty = False
 
 
 def _write_session():
-    """Persist current tool states + tool prefs to the session file."""
-    if _suppress_session_write:
+    """Mark the session dirty; flush runs via timer."""
+    global _session_dirty
+    if _suppress_session_write > 0:
         return
+    _session_dirty = True
+    if bpy.app.timers.is_registered(_flush_session_timer):
+        return
+    try:
+        bpy.app.timers.register(_flush_session_timer, first_interval=0.5)
+    except Exception:
+        _flush_session_now()
+
+
+def _flush_session_timer():
+    global _session_dirty
+    if _session_dirty:
+        _session_dirty = False
+        _flush_session_now()
+    return None
+
+
+def _flush_session_now():
+    """Force an immediate session write."""
     prefs = bpy.context.preferences.addons.get(__package__)
     if not prefs:
         return
@@ -121,38 +157,45 @@ def apply_session_if_any():
     load_default_tools(), and again on load_post when the loaded
     .blend carries no project preferences.
     """
-    global _suppress_session_write
     data = session_store.load_session()
     if data is None:
         return
     prefs = bpy.context.preferences.addons.get(__package__)
     if not prefs:
         return
-    _suppress_session_write = True
+    _push_suppress_session()
     try:
         prefs_io.import_prefs(prefs.preferences, core, data)
     except Exception as e:
         print(f"[XNeko] failed to apply session: {e}")
     finally:
-        _suppress_session_write = False
+        _pop_suppress_session()
 
 
 # ==================================================
 # Helpers
 # ==================================================
+_pref_prefix_map = {}
+
+
+def _reset_pref_prefixes():
+    _pref_prefix_map.clear()
+
+
 def _make_pref_prefix(full_id):
-    """Build a compact, unique prefix for a tool's preference props.
+    """Return a short, collision-free prefix for a tool's preference props.
 
-    Blender limits RNA property names to 63 characters. The full
-    dotted module path (the key in core._TOOL_REGISTRY) can easily
-    exceed that, so we hash it down to a fixed-width token:
-
-        "t_" + 12 hex chars of MD5(full_id) + "_"
-
-    That's 15 characters total, leaving 48 for the local name.
+    Blender limits RNA property names to 63 characters. The full dotted
+    module path can exceed that, so each tool gets a sequential prefix
+    like "t1_", "t2_", ... assigned the first time it is seen in a
+    given build pass.
     """
-    h = hashlib.md5(full_id.encode("utf-8")).hexdigest()[:12]
-    return f"t_{h}_"
+    cached = _pref_prefix_map.get(full_id)
+    if cached is not None:
+        return cached
+    prefix = f"t{len(_pref_prefix_map) + 1}_"
+    _pref_prefix_map[full_id] = prefix
+    return prefix
 
 
 def _full_id_map():
@@ -339,9 +382,8 @@ class XNEKO_ApplyPresetEntry(bpy.types.PropertyGroup):
 # ==================================================
 # Sentinel identifier for "no preset selected". Always present in
 # _preset_items so EnumProperty never fails to resolve its current
-# value. Must not collide with any real preset name (sanitize_name
-# strips leading underscores from Windows-reserved names but does not
-# forbid them, so "__none__" is safe enough in practice).
+# value. sanitize_name rejects any name starting with "__", so a
+# user-supplied preset can never collide with this sentinel.
 NONE_PRESET_ID = "__none__"
 
 
@@ -368,7 +410,14 @@ class XNEKO_OT_export_prefs(bpy.types.Operator):
 
     def invoke(self, context, event):
         if not self.preset_name:
-            self.preset_name = "Preset"
+            existing = set(_get_preset_list())
+            name = "Preset"
+            if name in existing:
+                n = 2
+                while f"Preset_{n}" in existing:
+                    n += 1
+                name = f"Preset_{n}"
+            self.preset_name = name
         return context.window_manager.invoke_props_dialog(self, width=320)
 
     def draw(self, context):
@@ -866,8 +915,7 @@ def _on_save_pre(dummy):
             return
         p = addon.preferences
 
-        data = prefs_io.export_prefs(p, core, name="__session__")
-        session_store.save_session(data)
+        _flush_session_now()
 
         if p.save_to_project:
             project_data = prefs_io.export_prefs(p, core, name="__project__")
@@ -1282,6 +1330,8 @@ def build_preferences_class(include_tool_props=True):
         ),
     }
 
+    _reset_pref_prefixes()
+
     if not include_tool_props:
         # Strip fallback: no per-tool props, no _pref_names either.
         # Tools that try to read their own prefs will get an empty
@@ -1387,11 +1437,10 @@ def _on_toggle(item):
     global _toggle_in_progress
     if _toggle_in_progress:
         return
-    if _suppress_toggle_load:
-        # Fired during init_tool_toggles(), which is only resetting the
-        # toggle list to defaults. Actual load/unload is handled by
-        # load_default_tools() / import_prefs() right after, so doing
-        # it here as well would just double the work.
+    if core.is_toggle_suppressed():
+        # Fired during init_tool_toggles() or a batch import, which
+        # only reset toggle values. Actual load/unload is driven
+        # separately by load_enabled_tools() / import_prefs().
         return
     _toggle_in_progress = True
     try:
@@ -1413,45 +1462,20 @@ def _on_toggle(item):
         _toggle_in_progress = False
 
 
-# Modules under XNeko_Tools.* that must NOT be evicted during a hot
-# reload. Anything else under the addon package gets dropped, which
-# covers tools placed outside tools/ (legacy layouts, companion
-# packages dropped into the addon folder).
-#
-# Maintenance note: add new framework modules here when you create
-# them, otherwise the first hot reload after adding one will wipe it
-# from sys.modules and break subsequent imports.
-_KEEP_MODULES = {
-    "core",
-    "preferences",
-    "common",
-    "common.error_reports",
-    "common.icon_store",
-    "common.prefs_io",
-    "common.preset_store",
-    "common.session_store",
-}
-
-
 def _drop_tool_submodules():
-    """Remove tool submodules from sys.modules.
-
-    Required for hot reload: importlib.import_module() returns the
-    cached module object if the module is still in sys.modules, so
-    freshly edited source would otherwise be ignored.
-
-    This variant evicts anything under the addon package except the
-    modules listed in _KEEP_MODULES, so tools placed outside tools/
-    are also covered.
-    """
+    """Evict every non-framework module under the addon package."""
     prefix = __package__ + "."
-    keep = {__package__ + "." + m for m in _KEEP_MODULES}
-
     dropped = 0
     for name in list(sys.modules.keys()):
-        if name.startswith(prefix) and name not in keep:
-            sys.modules.pop(name, None)
-            dropped += 1
+        if not name.startswith(prefix):
+            continue
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue
+        if getattr(mod, "__xneko_framework__", False):
+            continue
+        sys.modules.pop(name, None)
+        dropped += 1
     return dropped
 
 
@@ -1512,30 +1536,42 @@ def hot_reload_tools():
     if old_prefs is None:
         return False, "Add-on preferences are not available"
 
-    # ---- 1. Snapshot tool state (enabled flags + per-tool props) ----
+    # 1. Snapshot tool state (enabled flags + per-tool props).
     try:
         tool_snapshot = prefs_io.export_prefs(
             old_prefs, core, name="__hot_reload__",
         )
     except Exception as e:
         print(f"[XNeko] hot reload: tool snapshot failed: {e}")
+        _reports.report_critical_error(
+            "hot reload: tool snapshot failed",
+            exc=e,
+            extra={"effect": "tool states reset to defaults after reload"},
+        )
         tool_snapshot = None
 
-    # UI state is not covered by prefs_io.export_prefs, so grab it
-    # separately. Missing fields silently fall back to new defaults.
+    # UI state is not covered by prefs_io.export_prefs, so collect
+    # every scalar property on the preferences instance. Excluding
+    # collection and metadata fields is enough.
     ui_snapshot = {}
-    for attr in (
-        "panel_category", "active_category", "tab_page",
-        "project_section_expanded", "presets_section_expanded",
-        "tools_section_expanded", "links_section_expanded",
-        "diagnostics_section_expanded",
-        "save_to_project", "use_project_prefs", "enable_error_report",
-        "selected_preset",
-    ):
-        try:
-            ui_snapshot[attr] = getattr(old_prefs, attr)
-        except Exception:
-            pass
+    _SKIP = {
+        "name", "rna_type",
+        "tool_toggles", "registration_issues", "plugin_version",
+    }
+    try:
+        for prop in old_prefs.bl_rna.properties:
+            ident = prop.identifier
+            if ident.startswith("rna_") or ident in _SKIP:
+                continue
+            if prop.type not in {'BOOLEAN', 'INT', 'FLOAT',
+                                 'STRING', 'ENUM'}:
+                continue
+            try:
+                ui_snapshot[ident] = getattr(old_prefs, ident)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[XNeko] hot reload: ui snapshot failed: {e}")
 
     expanded_snapshot = {}
     try:
@@ -1544,36 +1580,37 @@ def hot_reload_tools():
     except Exception:
         pass
 
-    # ---- 2. Unload every loaded tool ----
+    # 2. Unload every loaded tool.
     try:
         core.unload_all_tools()
     except Exception as e:
         print(f"[XNeko] hot reload: unload_all_tools failed: {e}")
 
-    # ---- 3. Drop module cache + invalidate import caches ----
+    # 3. Drop the module cache and invalidate import caches.
     try:
         _drop_tool_submodules()
         importlib.invalidate_caches()
     except Exception as e:
         print(f"[XNeko] hot reload: module cache drop failed: {e}")
 
-    # ---- 4. Unregister old tool-owned preference classes ----
+    # 4. Unregister the old tool-owned preference classes.
     try:
         unregister_tool_preference_classes()
     except Exception as e:
         print(f"[XNeko] hot reload: pref class teardown failed: {e}")
 
-    # ---- 5. Re-discover everything ----
+    # 5. Re-discover every tool.
     try:
         core._initialize_tools()
     except Exception as e:
         print(f"[XNeko] hot reload: discovery failed: {e}")
         return False, f"Discovery failed: {e}"
 
-    # ---- 6. Register new tool-owned preference classes ----
+    # 6. Register the new tool-owned preference classes.
     register_tool_preference_classes()
 
-    # ---- 7. Rebuild the dynamic XNekoPreferences class ----
+    # 7. Rebuild the dynamic XNekoPreferences class.
+    #
     # Build the new class first, before touching the old one. If the
     # build itself raises, the old class is untouched and the addon
     # stays fully functional.
@@ -1622,22 +1659,24 @@ def hot_reload_tools():
                     )
             return False, f"Preferences rebuild failed: {e}"
 
-    # ---- 8. Post-rebuild steps, wrapped so a late failure does not
-    #         crash the operator or leave the addon half-broken. ----
+    # 8. Post-rebuild steps.
+    #
+    # Each sub-step is wrapped so a late failure does not crash the
+    # operator or leave the addon half-broken.
     try:
         addon = bpy.context.preferences.addons.get(__package__)
         if addon is None or addon.preferences is None:
             return False, "Preferences instance missing after rebuild"
         new_prefs = addon.preferences
 
-        # ---- 8a. Restore UI state onto the fresh instance ----
+        # 8a. Restore UI state onto the fresh instance.
         for attr, value in ui_snapshot.items():
             try:
                 setattr(new_prefs, attr, value)
             except Exception:
                 pass
 
-        # ---- 8b. Rebuild panels under the restored category ----
+        # 8b. Rebuild panels under the restored category.
         try:
             core.register_group_panels()
             core.attach_panels_to_groups()
@@ -1645,11 +1684,11 @@ def hot_reload_tools():
             print(f"[XNeko] hot reload: panel rebuild failed: {e}")
 
         try:
-            refresh_panel_category()
+            refresh_panel_category(force=True)
         except Exception as e:
             print(f"[XNeko] hot reload: category refresh failed: {e}")
 
-        # ---- 8c. Re-init toggles then restore per-tool state ----
+        # 8c. Re-init toggles, then restore per-tool state.
         init_tool_toggles()
 
         for it in new_prefs.tool_toggles:
@@ -1667,7 +1706,7 @@ def hot_reload_tools():
             except Exception as e:
                 print(f"[XNeko] hot reload: state restore failed: {e}")
 
-        # ---- 8d. Refresh issue blob on the new instance ----
+        # 8d. Refresh the issue blob on the new instance.
         try:
             new_prefs.registration_issues = json.dumps(
                 core._state.registration_issues
@@ -1689,14 +1728,13 @@ def init_tool_toggles():
 
     Both session write and per-toggle load are suppressed during this
     pass: the values here are provisional, and the actual load/unload
-    is driven by load_default_tools() / import_prefs() right after.
+    is driven by load_enabled_tools() right after.
     """
-    global _suppress_session_write, _suppress_toggle_load
     prefs = bpy.context.preferences.addons.get(__package__)
     if not prefs:
         return
-    _suppress_session_write = True
-    _suppress_toggle_load = True
+    _push_suppress_session()
+    core.push_toggle_suppress()
     try:
         p = prefs.preferences
         p.tool_toggles.clear()
@@ -1709,8 +1747,18 @@ def init_tool_toggles():
             else:
                 item.enabled = False
     finally:
-        _suppress_session_write = False
-        _suppress_toggle_load = False
+        core.pop_toggle_suppress()
+        _pop_suppress_session()
+
+
+def load_enabled_tools():
+    """Load every tool whose toggle is currently enabled."""
+    prefs = bpy.context.preferences.addons.get(__package__)
+    if not prefs:
+        return
+    for item in prefs.preferences.tool_toggles:
+        if item.enabled:
+            core.set_tool_enabled(item.tool_id, True)
 
 
 def clear_tool_toggles():
@@ -1723,7 +1771,11 @@ def clear_tool_toggles():
 # ==================================================
 # Panel category refresh (with rollback)
 # ==================================================
-def refresh_panel_category():
+_last_category = None
+
+
+def refresh_panel_category(force=False):
+    global _last_category
     prefs = bpy.context.preferences.addons.get(__package__)
     if not prefs:
         return
@@ -1731,6 +1783,10 @@ def refresh_panel_category():
     new_category = (
         prefs.preferences.panel_category or "XNeko Tools"
     ).strip() or "XNeko Tools"
+
+    if not force and new_category == _last_category:
+        return
+    _last_category = new_category
 
     all_panels = list(core._GROUP_PANEL_CLASSES)
     for tool in core._TOOL_REGISTRY.values():
@@ -1766,3 +1822,21 @@ def refresh_panel_category():
                 bpy.utils.register_class(cls)
             except Exception as e2:
                 print(f"[XNeko]   rollback also failed: {e2}")
+
+
+def iter_preference_operators():
+    """Yield every Operator class defined in this module."""
+    mod = sys.modules[__name__]
+    for _name, obj in list(vars(mod).items()):
+        if not isinstance(obj, type):
+            continue
+        try:
+            if not issubclass(obj, bpy.types.Operator):
+                continue
+        except TypeError:
+            continue
+        if obj is bpy.types.Operator:
+            continue
+        if getattr(obj, "__module__", None) != __name__:
+            continue
+        yield obj

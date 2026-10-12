@@ -4,7 +4,7 @@
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 9, 0),
+    "version": (0, 9, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (
@@ -43,30 +43,28 @@ def register():
 
 
 def _register_impl():
-    # ---- 1. Discovery + issue collection ----
+    # 1. Discover tools and collect any registration issues.
     core._initialize_tools()
 
-    # ---- 2. Tool-owned PropertyGroups used by preferences ----
+    # 2. Register every tool-owned PropertyGroup used by preferences.
     preferences.register_tool_preference_classes()
 
-    # ---- 3. Base operator / property classes ----
-    bpy.utils.register_class(preferences.XNEKO_OT_set_active_category)
-    bpy.utils.register_class(preferences.XNEKO_OT_shift_tab_page)
+    # 3. Register the base property groups.
     bpy.utils.register_class(preferences.XNekoToolToggle)
     bpy.utils.register_class(preferences.XNEKO_ApplyPresetEntry)
 
-    # ---- 4. Build XNekoPreferences with dynamic per-tool props ----
-    # The duck-type filter in build_preferences_class catches the vast
-    # majority of bad props, but it is not a full RNA validation. If a
-    # prop still slips through and makes the class unregisterable, we
-    # rebuild without per-tool props so the addon itself stays alive.
+    # 4. Build and register the dynamic XNekoPreferences class.
+    #
+    # build_preferences_class filters out bad per-tool props, but the
+    # filter is duck-typed, not a full RNA validation. If a prop still
+    # slips through and makes the class unregisterable, rebuild
+    # without per-tool props so the addon itself stays alive.
     preferences.XNekoPreferences = preferences.build_preferences_class()
     try:
         bpy.utils.register_class(preferences.XNekoPreferences)
     except Exception as e:
         print(f"[XNeko] XNekoPreferences registration failed: {e}")
         print("[XNeko] retrying without per-tool preference props")
-        # Addon infrastructure failure: always-on critical channel.
         _reports.report_critical_error(
             "XNekoPreferences registration failed",
             exc=e,
@@ -81,14 +79,15 @@ def _register_impl():
         )
         bpy.utils.register_class(preferences.XNekoPreferences)
 
-    # ---- 4b. Flush tool reports queued during discovery ----
-    # Discovery runs before preferences are registered, so tool
-    # reports raised there are buffered. Now that XNekoPreferences
-    # exists, the user toggle can be read and pending reports
-    # written. No-op if the queue is empty or the toggle is off.
+    # 5. Flush tool reports queued during discovery.
+    #
+    # Discovery runs before preferences are registered, so reports
+    # raised there are buffered. Now that XNekoPreferences exists,
+    # the user toggle can be read and pending reports written. No-op
+    # if the queue is empty or the toggle is off.
     _reports.flush_pending()
 
-    # ---- 5. Write registration issues + plugin version into prefs ----
+    # 6. Write registration issues and plugin version into prefs.
     try:
         prefs = bpy.context.preferences.addons[__name__].preferences
         prefs.registration_issues = json.dumps(core._state.registration_issues)
@@ -96,56 +95,47 @@ def _register_impl():
     except Exception as e:
         print(f"[XNeko] failed to write prefs metadata: {e}")
 
-    # ---- 6. Panels ----
+    # 7. Register the group panels and attach tool panels to them.
     core.register_group_panels()
     core.attach_panels_to_groups()
 
-    # ---- 7. Toggles + category + defaults ----
+    # 8. Populate the toggle list and apply the panel category.
     preferences.init_tool_toggles()
     preferences.refresh_panel_category()
-    core.load_default_tools()
 
-    # ---- 7b. Restore last session state, if any ----
-    # Overrides the defaults that were just applied, so the user's
-    # last-known tool enable flags survive Blender restarts.
+    # 9. Overlay the session state before loading anything, so tools
+    #    that are on by default but disabled in the session never load.
     preferences.apply_session_if_any()
 
-    # ---- 8. Preference IO operators ----
-    for name in (
-        "XNEKO_OT_export_prefs",
-        "XNEKO_OT_import_prefs",
-        "XNEKO_OT_confirm_overwrite",
-        "XNEKO_OT_apply_preset",
-        "XNEKO_OT_apply_preset_select_all",
-        "XNEKO_OT_delete_preset",
-        "XNEKO_OT_refresh_presets",
-        "XNEKO_OT_apply_project_prefs",
-        "XNEKO_OT_clear_project_prefs",
-        "XNEKO_OT_rescan_tools",
-        "XNEKO_OT_open_user_reports_folder",
-        "XNEKO_OT_open_critical_reports_folder",
-        "XNEKO_OT_clear_user_reports",
-        "XNEKO_OT_clear_critical_reports",
-    ):
-        cls = getattr(preferences, name, None)
-        if cls is None:
-            print(f"[XNeko] missing operator: {name}")
-            continue
+    # 10. Load every tool whose toggle is currently on.
+    preferences.load_enabled_tools()
+
+    # 11. Register the preference IO operators.
+    for cls in preferences.iter_preference_operators():
         try:
             bpy.utils.register_class(cls)
         except Exception as e:
-            print(f"[XNeko] register {name} failed: {e}")
+            print(f"[XNeko] register {cls.__name__} failed: {e}")
 
-    # ---- 9. Handlers ----
+    # 12. Register the app handlers.
     bpy.app.handlers.load_post.append(preferences._on_load_post)
     bpy.app.handlers.save_pre.append(preferences._on_save_pre)
 
 
 def unregister():
-    from .common import icon_store as _icon_store
-    _icon_store.clear()
+    # 1. Flush any pending session write and drop the icon cache.
+    try:
+        preferences._flush_session_now()
+    except Exception:
+        pass
 
-    # ---- 0. Handlers first ----
+    try:
+        from .common import icon_store as _icon_store
+        _icon_store.clear()
+    except Exception:
+        pass
+
+    # 2. Remove the app handlers.
     try:
         bpy.app.handlers.save_pre.remove(preferences._on_save_pre)
     except Exception:
@@ -155,41 +145,23 @@ def unregister():
     except Exception:
         pass
 
-    # ---- 1. Preference IO operators ----
-    for name in (
-        "XNEKO_OT_clear_project_prefs",
-        "XNEKO_OT_apply_project_prefs",
-        "XNEKO_OT_refresh_presets",
-        "XNEKO_OT_delete_preset",
-        "XNEKO_OT_apply_preset",
-        "XNEKO_OT_apply_preset_select_all",
-        "XNEKO_OT_confirm_overwrite",
-        "XNEKO_OT_import_prefs",
-        "XNEKO_OT_export_prefs",
-        "XNEKO_OT_rescan_tools",
-        "XNEKO_OT_open_user_reports_folder",
-        "XNEKO_OT_open_critical_reports_folder",
-        "XNEKO_OT_clear_user_reports",
-        "XNEKO_OT_clear_critical_reports",
-    ):
-        cls = getattr(preferences, name, None)
-        if cls is None:
-            continue
+    # 3. Unregister the preference IO operators.
+    for cls in reversed(list(preferences.iter_preference_operators())):
         try:
             bpy.utils.unregister_class(cls)
         except Exception:
             pass
 
-    # ---- 2. Unload every loaded tool ----
+    # 4. Unload every loaded tool.
     core.unload_all_tools()
 
-    # ---- 3. Clear toggle list ----
+    # 5. Clear the toggle list.
     preferences.clear_tool_toggles()
 
-    # ---- 4. Remove group panels ----
+    # 6. Remove the group panels.
     core.unregister_group_panels()
 
-    # ---- 5. Base classes (reverse of registration) ----
+    # 7. Unregister the dynamic XNekoPreferences class.
     if preferences.XNekoPreferences is not None:
         try:
             bpy.utils.unregister_class(preferences.XNekoPreferences)
@@ -197,18 +169,24 @@ def unregister():
             pass
         preferences.XNekoPreferences = None
 
-    bpy.utils.unregister_class(preferences.XNEKO_ApplyPresetEntry)
-    bpy.utils.unregister_class(preferences.XNekoToolToggle)
-    bpy.utils.unregister_class(preferences.XNEKO_OT_shift_tab_page)
-    bpy.utils.unregister_class(preferences.XNEKO_OT_set_active_category)
+    # 8. Unregister the base property groups.
+    try:
+        bpy.utils.unregister_class(preferences.XNEKO_ApplyPresetEntry)
+    except Exception:
+        pass
+    try:
+        bpy.utils.unregister_class(preferences.XNekoToolToggle)
+    except Exception:
+        pass
 
-    # ---- 6. Preference helper PropertyGroups ----
+    # 9. Unregister tool-owned preference classes.
     preferences.unregister_tool_preference_classes()
 
-    # ---- 7. Clear plugin state ----
-    core._state.clear()
+    # 10. Clear the plugin state.
+    #
     # _state.clear() resets groups / issues / previews but deliberately
     # leaves _TOOL_REGISTRY alone (discover_tools re-clears it on the
     # next register). Clear it here too so a disabled addon does not
     # expose a stale registry to external code.
+    core._state.clear()
     core._TOOL_REGISTRY.clear()

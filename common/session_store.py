@@ -16,6 +16,8 @@ import json
 import bpy
 
 
+__xneko_framework__ = True
+
 SESSION_FILE_NAME = "session.json"
 
 
@@ -55,11 +57,17 @@ def load_session():
 def save_session(data):
     """Write the session dict to disk. Never raises."""
     path = session_path()
+    tmp = path + ".tmp"
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
     except Exception as e:
         print(f"[XNeko] failed to save session: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def clear_session():

@@ -5,6 +5,8 @@ import json
 import bpy
 
 
+__xneko_framework__ = True
+
 FORMAT_TAG = "xneko_prefs"
 
 PROJECT_KEY = "xneko_project_prefs"
@@ -13,6 +15,14 @@ PROJECT_KEY = "xneko_project_prefs"
 # ============================================================
 # Introspection helpers
 # ============================================================
+def _normalize_version(v):
+    """Coerce a version sequence to a 3-tuple of ints."""
+    if not v:
+        return None
+    t = tuple(int(x) for x in tuple(v)[:3])
+    return t + (0,) * (3 - len(t))
+
+
 def _short_id(core, full_id):
     """Return the preset key for a registered tool.
 
@@ -48,8 +58,8 @@ def _tool_version_bounds(tool):
     lost compatibility checks. The live-module read is kept as a
     fallback for external callers.
     """
-    minv = tool.get("version_min")
-    maxv = tool.get("version_max")
+    minv = _normalize_version(tool.get("version_min"))
+    maxv = _normalize_version(tool.get("version_max"))
     if minv is not None or maxv is not None:
         return (
             list(minv) if minv else None,
@@ -60,8 +70,8 @@ def _tool_version_bounds(tool):
     if module is None:
         return None, None
 
-    minv = getattr(module, "blender_version_min", None)
-    maxv = getattr(module, "blender_version_max", None)
+    minv = _normalize_version(getattr(module, "blender_version_min", None))
+    maxv = _normalize_version(getattr(module, "blender_version_max", None))
     return (
         list(minv) if minv else None,
         list(maxv) if maxv else None,
@@ -91,9 +101,7 @@ def _collect_tool_preferences(prefs_obj, tool):
         if not hasattr(prefs_obj, full_attr):
             continue
         try:
-            value = getattr(prefs_obj, full_attr)
-            json.dumps(value)
-            out[local_name] = value
+            out[local_name] = getattr(prefs_obj, full_attr)
         except Exception:
             continue
     return out
@@ -184,14 +192,14 @@ def _classify(core, data):
             )
             continue
 
-        minv = saved.get("__version_min__")
-        maxv = saved.get("__version_max__")
-        if minv and bv < tuple(minv):
+        minv = _normalize_version(saved.get("__version_min__"))
+        maxv = _normalize_version(saved.get("__version_max__"))
+        if minv and bv < minv:
             skipped.append(
                 (short, f"Requires Blender {'.'.join(map(str, minv))}+")
             )
             continue
-        if maxv and bv > tuple(maxv):
+        if maxv and bv > maxv:
             skipped.append(
                 (short,
                  f"Supports Blender up to {'.'.join(map(str, maxv))}")
@@ -239,15 +247,14 @@ def import_prefs(prefs_obj, core, data, only_tools=None):
 
         item = toggles.get(full_id)
         if item is None:
-            # No toggle row for this tool (e.g. a stale preset entry
-            # for a tool that just disappeared). Fall back to a direct
-            # call so state stays consistent when possible.
             _set_tool_enabled(core, full_id, target)
         elif item.enabled != target:
-            # Assigning .enabled fires the update callback, which
-            # routes through _set_tool_enabled itself.
-            item.enabled = target
-        # else: already at the target value, nothing to do.
+            _set_tool_enabled(core, full_id, target)
+            core.push_toggle_suppress()
+            try:
+                item.enabled = target
+            finally:
+                core.pop_toggle_suppress()
 
         values = saved_entry.get("preferences")
         if values:
@@ -267,8 +274,17 @@ def save_to_file(path, data):
     folder = os.path.dirname(path)
     if folder:
         os.makedirs(folder, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_from_file(path):

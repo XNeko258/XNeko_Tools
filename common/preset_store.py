@@ -13,6 +13,9 @@ import bpy
 from . import prefs_io
 
 
+__xneko_framework__ = True
+
+
 # ============================================================
 # Directory resolution
 # ============================================================
@@ -147,6 +150,10 @@ def sanitize_name(name):
     if not cleaned:
         return ""
     if cleaned.upper().split(".", 1)[0] in _WINDOWS_RESERVED:
+        cleaned = "_" + cleaned
+    # Reserve the "__" prefix so preset names can never collide with
+    # internal sentinels such as preferences.NONE_PRESET_ID.
+    while cleaned.startswith("__"):
         cleaned = "_" + cleaned
     if len(cleaned) > 120:
         cleaned = cleaned[:120].rstrip()

@@ -16,6 +16,9 @@ import os
 import bpy
 
 
+__xneko_framework__ = True
+
+
 _PLUGIN_ROOT = os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))
 )

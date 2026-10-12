@@ -11,6 +11,9 @@ import json
 from .common import error_reports as _reports
 
 
+__xneko_framework__ = True
+
+
 # ============================================================
 # Constants
 # ============================================================
@@ -249,20 +252,28 @@ def find_class_line(module_path, class_name):
 # ============================================================
 # Version compatibility
 # ============================================================
+def _normalize_version(v):
+    """Coerce a version sequence to a 3-tuple of ints."""
+    if not v:
+        return None
+    t = tuple(int(x) for x in tuple(v)[:3])
+    return t + (0,) * (3 - len(t))
+
+
 def _check_tool_compatibility(module):
     """Return (compatible, reason)."""
     bv = tuple(bpy.app.version)[:3]
     current = ".".join(str(v) for v in bv)
 
-    min_v = getattr(module, "blender_version_min", None)
-    max_v = getattr(module, "blender_version_max", None)
+    min_v = _normalize_version(getattr(module, "blender_version_min", None))
+    max_v = _normalize_version(getattr(module, "blender_version_max", None))
 
-    if min_v is not None and bv < tuple(min_v)[:3]:
-        req = ".".join(str(v) for v in min_v[:3])
+    if min_v is not None and bv < min_v:
+        req = ".".join(str(v) for v in min_v)
         return False, f"Requires Blender {req}+ (current {current})"
 
-    if max_v is not None and bv > tuple(max_v)[:3]:
-        req = ".".join(str(v) for v in max_v[:3])
+    if max_v is not None and bv > max_v:
+        req = ".".join(str(v) for v in max_v)
         return False, f"Supports Blender up to {req} (current {current})"
 
     return True, ""
@@ -298,8 +309,8 @@ def get_short_id(full_id):
 # Discovery
 # ============================================================
 def discover_tools(package_name, package_path):
-    _TOOL_REGISTRY.clear()
-    _state.registration_issues = []
+    _state.registration_issues.clear()
+    new_registry = {}
 
     prefix = f"{package_name}."
     for info in pkgutil.walk_packages(package_path, prefix=prefix):
@@ -423,7 +434,7 @@ def discover_tools(package_name, package_path):
                 getattr(module, "scene_props", {})
             )
 
-            _TOOL_REGISTRY[info.name] = {
+            new_registry[info.name] = {
                 "module_name": info.name,
                 "tool_id": tool_id,
                 "module": module,
@@ -458,7 +469,7 @@ def discover_tools(package_name, package_path):
                 "loaded": False,
             }
 
-            tool = _TOOL_REGISTRY[info.name]
+            tool = new_registry[info.name]
             ok, reason = _check_tool_compatibility(module)
             tool["compatible"] = ok
             tool["incompatible_reason"] = reason
@@ -467,7 +478,7 @@ def discover_tools(package_name, package_path):
         except Exception as e:
             # Roll back any half-written entry, then record the issue
             # and move on to the next module.
-            _TOOL_REGISTRY.pop(info.name, None)
+            new_registry.pop(info.name, None)
             _state.registration_issues.append({
                 "type": "invalid_declaration",
                 "tool_id": tool_id,
@@ -494,6 +505,9 @@ def discover_tools(package_name, package_path):
                 },
             )
             continue
+        
+    _TOOL_REGISTRY.clear()
+    _TOOL_REGISTRY.update(new_registry)
 
 
 def collect_registration_issues():
@@ -700,21 +714,33 @@ def load_group_icon_preview(group_name, group_path, icon_value):
     return key
 
 
+def _read_group_icon_decl(init_file):
+    """Read `group_icon = "..."` from a file without executing it."""
+    if not init_file or not os.path.isfile(init_file):
+        return None
+    try:
+        import ast
+        with open(init_file, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), filename=init_file)
+    except Exception:
+        return None
+
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [
+            t.id for t in node.targets if isinstance(t, ast.Name)
+        ]
+        if "group_icon" not in names:
+            continue
+        if isinstance(node.value, ast.Constant):
+            return node.value.value
+    return None
+
+
 def resolve_group_icon(group_name, group_path):
     init_file = os.path.join(group_path, "__init__.py")
-    raw_value = None
-
-    if os.path.exists(init_file):
-        spec = importlib.util.spec_from_file_location(
-            "xneko_group_init", init_file
-        )
-        if spec is not None and spec.loader is not None:
-            mod = importlib.util.module_from_spec(spec)
-            try:
-                spec.loader.exec_module(mod)
-                raw_value = getattr(mod, "group_icon", None)
-            except Exception:
-                pass
+    raw_value = _read_group_icon_decl(init_file)
 
     if not raw_value:
         return {"type": "builtin", "value": _get_group_icon(group_name)}
@@ -762,17 +788,30 @@ def _initialize_tools():
 # ============================================================
 # Group panels
 # ============================================================
+_GROUP_LOADED_COUNT = {}
+
+
+def _group_loaded_inc(gid):
+    _GROUP_LOADED_COUNT[gid] = _GROUP_LOADED_COUNT.get(gid, 0) + 1
+
+
+def _group_loaded_dec(gid):
+    n = _GROUP_LOADED_COUNT.get(gid, 0) - 1
+    if n <= 0:
+        _GROUP_LOADED_COUNT.pop(gid, None)
+    else:
+        _GROUP_LOADED_COUNT[gid] = n
+
+
 def _make_group_panel(group_id, display_name, category):
     safe = group_id.replace(".", "_").replace(" ", "_")
     bl_idname = f"VIEW3D_PT_xneko_grp_{safe}"
 
     def _poll(cls, context):
-        for tool in _TOOL_REGISTRY.values():
-            if tool["group_id"] == group_id and tool["loaded"]:
-                return True
-        return False
+        return _GROUP_LOADED_COUNT.get(group_id, 0) > 0
 
     def _draw(self, ctx):
+        # Group panels only carry tool sub-panels as children.
         pass
 
     return type(
@@ -826,6 +865,7 @@ def unregister_group_panels():
             pass
     _GROUP_PANELS.clear()
     _GROUP_PANEL_CLASSES.clear()
+    _GROUP_LOADED_COUNT.clear()
 
 
 def attach_panels_to_groups(tool=None):
@@ -924,10 +964,9 @@ def load_tool(tool_id):
             except Exception as e:
                 print(f"[XNeko] register {cls.__name__} failed: {e}")
 
-    # ---- NEW: isolate Scene prop injection ----
-    # A malformed scene_prop (e.g. a plain string instead of a
-    # bpy.props property) would raise here and abort load_tool,
-    # leaving the tool half-loaded. Catch per-prop and continue.
+    # Isolate Scene prop injection: a malformed scene_prop (e.g. a
+    # plain string instead of a bpy.props property) would otherwise
+    # raise here and abort load_tool, leaving the tool half-loaded.
     tool_file = getattr(tool["module"], "__file__", None)
 
     for name, prop in tool["scene_props"].items():
@@ -948,7 +987,6 @@ def load_tool(tool_id):
                     ),
                 },
             )
-    # ---- END NEW ----
 
     if callable(tool["on_load"]):
         try:
@@ -957,6 +995,7 @@ def load_tool(tool_id):
             print(f"[XNeko] on_load for {tool_id} failed: {e}")
 
     tool["loaded"] = True
+    _group_loaded_inc(tool["group_id"])
 
 
 def unload_tool(tool_id):
@@ -976,24 +1015,38 @@ def unload_tool(tool_id):
         except Exception:
             pass
 
+    _group_loaded_dec(tool["group_id"])
+
+    # Unregister non-PropertyGroup classes first so no registered
+    # operator or panel is left referencing an unregistered
+    # PropertyGroup.
     for cls in reversed(tool["classes"]):
-        if isinstance(cls, type):
+        if (isinstance(cls, type)
+                and not issubclass(cls, bpy.types.PropertyGroup)):
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                pass
+
+    for cls in reversed(tool["classes"]):
+        if isinstance(cls, type) and issubclass(cls, bpy.types.PropertyGroup):
             try:
                 bpy.utils.unregister_class(cls)
             except Exception:
                 pass
 
     module_name = tool["module_name"]
-
     tool["module"] = None
-    sys.modules.pop(module_name, None)
+
+    prefix = module_name + "."
+    for mod_name in list(sys.modules):
+        if mod_name == module_name or mod_name.startswith(prefix):
+            sys.modules.pop(mod_name, None)
 
     tool["classes"] = ()
     tool["scene_props"] = {}
     tool["on_load"] = None
     tool["on_unload"] = None
-
-    gc.collect()
 
     tool["loaded"] = False
 
@@ -1024,6 +1077,8 @@ def load_default_tools():
 def unload_all_tools():
     for tool_id in tuple(_TOOL_REGISTRY):
         unload_tool(tool_id)
+    _GROUP_LOADED_COUNT.clear()
+    gc.collect()
 
 
 # ============================================================
@@ -1056,7 +1111,6 @@ def draw_registration_issues(self, layout):
             box.label(
                 text=f"Import failed: {issue.get('error', 'unknown error')}"
             )
-        # ---- NEW: show the two new issue types ----
         elif issue_type == "invalid_declaration":
             box.label(
                 text=f"Invalid tool declaration: "
@@ -1067,7 +1121,6 @@ def draw_registration_issues(self, layout):
                 text=f"Invalid preference prop: "
                      f"{issue.get('error', 'unknown error')}"
             )
-        # ---- END NEW ----
         else:
             box.label(text=f"Tool id collision: {issue['tool_id']}")
 
@@ -1108,3 +1161,28 @@ def draw_group_header(layout, group_name, registered_groups):
 
     else:
         layout.label(text=f"{icon_value} {group_name}")
+
+
+# ============================================================
+# Toggle suppression
+#
+# Batch operations (init_tool_toggles, import_prefs) push this
+# counter while assigning toggle values, so _on_toggle does not
+# fire redundant load/unload work for every tool.
+# ============================================================
+_suppress_toggle_load = 0
+
+
+def push_toggle_suppress():
+    global _suppress_toggle_load
+    _suppress_toggle_load += 1
+
+
+def pop_toggle_suppress():
+    global _suppress_toggle_load
+    if _suppress_toggle_load > 0:
+        _suppress_toggle_load -= 1
+
+
+def is_toggle_suppressed():
+    return _suppress_toggle_load > 0
