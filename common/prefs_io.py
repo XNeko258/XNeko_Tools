@@ -92,16 +92,17 @@ def _set_tool_enabled(core, tool_id, enabled):
 # Preference value collection
 # ============================================================
 def _collect_tool_preferences(prefs_obj, tool):
-    names = tool.get("_pref_names") or {}
-    if not names:
+    attr = tool.get("_pref_pg_attr")
+    if not attr:
+        return {}
+    pg = getattr(prefs_obj, attr, None)
+    if pg is None:
         return {}
 
     out = {}
-    for local_name, full_attr in names.items():
-        if not hasattr(prefs_obj, full_attr):
-            continue
+    for local_name in (tool.get("preference_props") or {}):
         try:
-            out[local_name] = getattr(prefs_obj, full_attr)
+            out[local_name] = getattr(pg, local_name)
         except Exception:
             continue
     return out
@@ -111,16 +112,18 @@ def _apply_tool_preferences(prefs_obj, tool, values):
     if not values:
         return
 
-    names = tool.get("_pref_names") or {}
-    if not names:
+    attr = tool.get("_pref_pg_attr")
+    if not attr:
+        return
+    pg = getattr(prefs_obj, attr, None)
+    if pg is None:
         return
 
     for local_name, value in values.items():
-        full_attr = names.get(local_name)
-        if not full_attr or not hasattr(prefs_obj, full_attr):
+        if not hasattr(pg, local_name):
             continue
         try:
-            setattr(prefs_obj, full_attr, value)
+            setattr(pg, local_name, value)
         except Exception as e:
             print(
                 f"[XNeko] failed to apply pref '{local_name}' "

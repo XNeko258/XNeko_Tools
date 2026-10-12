@@ -4,7 +4,7 @@
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 9, 1),
+    "version": (0, 9, 5),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (
@@ -53,31 +53,11 @@ def _register_impl():
     bpy.utils.register_class(preferences.XNekoToolToggle)
     bpy.utils.register_class(preferences.XNEKO_ApplyPresetEntry)
 
-    # 4. Build and register the dynamic XNekoPreferences class.
-    #
-    # build_preferences_class filters out bad per-tool props, but the
-    # filter is duck-typed, not a full RNA validation. If a prop still
-    # slips through and makes the class unregisterable, rebuild
-    # without per-tool props so the addon itself stays alive.
-    preferences.XNekoPreferences = preferences.build_preferences_class()
-    try:
-        bpy.utils.register_class(preferences.XNekoPreferences)
-    except Exception as e:
-        print(f"[XNeko] XNekoPreferences registration failed: {e}")
-        print("[XNeko] retrying without per-tool preference props")
-        _reports.report_critical_error(
-            "XNekoPreferences registration failed",
-            exc=e,
-            extra={"fallback": "include_tool_props=False"},
-        )
-        # The fallback rebuild resets every tool's _pref_names to {}.
-        # Any invalid_pref_prop issue recorded by the first pass stays
-        # in core._state.registration_issues on purpose: the UI should
-        # still surface it so the author can fix the offending prop.
-        preferences.XNekoPreferences = (
-            preferences.build_preferences_class(include_tool_props=False)
-        )
-        bpy.utils.register_class(preferences.XNekoPreferences)
+    # 4. Build and register the dynamic XNekoPreferences class and
+    #    every per-tool preference PropertyGroup. install_preferences
+    #    handles the fallback path internally if a prop slips past
+    #    the duck-typed filter.
+    preferences.install_preferences()
 
     # 5. Flush tool reports queued during discovery.
     #
@@ -161,13 +141,9 @@ def unregister():
     # 6. Remove the group panels.
     core.unregister_group_panels()
 
-    # 7. Unregister the dynamic XNekoPreferences class.
-    if preferences.XNekoPreferences is not None:
-        try:
-            bpy.utils.unregister_class(preferences.XNekoPreferences)
-        except Exception:
-            pass
-        preferences.XNekoPreferences = None
+    # 7. Unregister the dynamic XNekoPreferences class and every
+    #    per-tool preference PropertyGroup.
+    preferences.uninstall_preferences()
 
     # 8. Unregister the base property groups.
     try:
@@ -190,3 +166,4 @@ def unregister():
     # expose a stale registry to external code.
     core._state.clear()
     core._TOOL_REGISTRY.clear()
+    preferences._reset_panel_category_cache()

@@ -6,7 +6,7 @@ import importlib
 import bpy
 from bpy.props import (
     StringProperty, BoolProperty, CollectionProperty, IntProperty,
-    EnumProperty,
+    EnumProperty, PointerProperty,
 )
 from bpy_extras.io_utils import ImportHelper
 
@@ -60,6 +60,23 @@ LINKS = (
 )
 
 
+def _build_links_by_author():
+    by_author = {}
+    for label, url, icon, author in LINKS:
+        by_author.setdefault(author, []).append((label, url, icon))
+    return by_author
+
+
+_links_by_author_cache = None
+
+
+def _get_links_by_author():
+    global _links_by_author_cache
+    if _links_by_author_cache is None:
+        _links_by_author_cache = _build_links_by_author()
+    return _links_by_author_cache
+
+
 # ==================================================
 # Preset list cache
 # ==================================================
@@ -80,6 +97,53 @@ def _get_preset_list():
 def _invalidate_preset_cache():
     global _preset_cache
     _preset_cache = None
+
+
+# Cached gid -> [toggle items] map for _draw_preferences. Rebuilt
+# only when the toggle collection size changes, so panel redraws in
+# a session with 500 tools do not rebuild it every frame.
+_groups_cache = None
+_groups_cache_key = None
+
+
+def _get_groups(prefs_obj):
+    global _groups_cache, _groups_cache_key
+    key = len(prefs_obj.tool_toggles)
+    if _groups_cache_key == key and _groups_cache is not None:
+        return _groups_cache
+
+    groups = {}
+    for item in prefs_obj.tool_toggles:
+        tool = core._TOOL_REGISTRY.get(item.tool_id)
+        gid = tool["group_id"] if tool else ""
+        groups.setdefault(gid or "(root)", []).append(item)
+
+    _groups_cache = groups
+    _groups_cache_key = key
+    return groups
+
+
+def _invalidate_groups_cache():
+    global _groups_cache, _groups_cache_key
+    _groups_cache = None
+    _groups_cache_key = None
+    _invalidate_display_text_cache()
+
+
+_display_text_cache = {}
+
+
+def _get_display_text(gid):
+    cached = _display_text_cache.get(gid)
+    if cached is not None:
+        return cached
+    text = gid.replace(".", " / ").replace("_", " ").title()
+    _display_text_cache[gid] = text
+    return text
+
+
+def _invalidate_display_text_cache():
+    _display_text_cache.clear()
 
 
 # ==================================================
@@ -176,26 +240,101 @@ def apply_session_if_any():
 # Helpers
 # ==================================================
 _pref_prefix_map = {}
+_registered_pg_classes = []
+_build_generation = 0
 
 
 def _reset_pref_prefixes():
     _pref_prefix_map.clear()
 
 
-def _make_pref_prefix(full_id):
-    """Return a short, collision-free prefix for a tool's preference props.
+def _make_pref_attr(full_id):
+    """Return a short, unique attribute name for a tool's PG pointer.
 
-    Blender limits RNA property names to 63 characters. The full dotted
-    module path can exceed that, so each tool gets a sequential prefix
-    like "t1_", "t2_", ... assigned the first time it is seen in a
-    given build pass.
+    XNekoPreferences holds one PointerProperty per tool. The full
+    dotted module path can exceed Blender's 63-char RNA name limit,
+    so each tool gets a sequential name like "t1", "t2", ...
     """
     cached = _pref_prefix_map.get(full_id)
     if cached is not None:
         return cached
-    prefix = f"t{len(_pref_prefix_map) + 1}_"
-    _pref_prefix_map[full_id] = prefix
-    return prefix
+    name = f"t{len(_pref_prefix_map) + 1}"
+    _pref_prefix_map[full_id] = name
+    return name
+
+
+def _build_tool_pg_classes():
+    """Create one PropertyGroup class per tool.
+
+    Each class holds only that tool's preference_props, so no single
+    RNA type accumulates annotations across tools. Returns a list of
+    (pg_cls, attr_name, tool_record) tuples. Class names carry a
+    build-generation suffix so successive rebuilds do not clash while
+    the previous generation is still registered.
+    """
+    global _build_generation
+    _build_generation += 1
+    gen = _build_generation
+
+    _reset_pref_prefixes()
+    result = []
+
+    for full_id, tool in core._TOOL_REGISTRY.items():
+        actual_tool_id = tool.get("tool_id", full_id)
+        props = tool.get("preference_props") or {}
+
+        tool_annotations = {}
+        for name, prop in props.items():
+            if not _is_property_like(prop):
+                core._state.registration_issues.append({
+                    "type": "invalid_pref_prop",
+                    "tool_id": actual_tool_id,
+                    "paths": [f"{full_id}.preference_props['{name}']"],
+                    "error": (
+                        f"value is {type(prop).__name__}, expected a "
+                        f"bpy.props property (e.g. BoolProperty())"
+                    ),
+                })
+                print(
+                    f"[XNeko] dropped preference_props['{name}'] of "
+                    f"{actual_tool_id}: not a bpy.props property"
+                )
+                mod = tool.get("module")
+                mod_file = getattr(mod, "__file__", None) if mod else None
+                _reports.report_tool_error(
+                    "invalid preference prop dropped",
+                    extra={
+                        "tool_id": actual_tool_id,
+                        "name": name,
+                        "value_type": type(prop).__name__,
+                        "file": mod_file,
+                        "field": "preference_props",
+                        "line": core.find_assignment_line(
+                            mod_file, "preference_props"
+                        ),
+                    },
+                )
+                continue
+            tool_annotations[name] = prop
+
+        if not tool_annotations:
+            tool["_pref_pg_cls"] = None
+            tool["_pref_pg_attr"] = None
+            continue
+
+        attr_name = _make_pref_attr(full_id)
+        cls_name = f"XNekoToolPrefs_{attr_name}_g{gen}"
+        pg_cls = type(
+            cls_name,
+            (bpy.types.PropertyGroup,),
+            {"__annotations__": tool_annotations},
+        )
+
+        tool["_pref_pg_cls"] = pg_cls
+        tool["_pref_pg_attr"] = attr_name
+        result.append((pg_cls, attr_name, tool))
+
+    return result
 
 
 def _full_id_map():
@@ -236,53 +375,59 @@ def _redraw_view3d(context=None):
 
 
 class _ToolPrefNamespace:
-    """Thin wrapper giving tools an ergonomic view of their prefs."""
+    """Thin wrapper around a tool's preference PropertyGroup."""
 
-    def __init__(self, obj, names):
-        d = self.__dict__
-        d["_obj"] = obj
-        d["_names"] = names
+    def __init__(self, pg):
+        object.__setattr__(self, "_pg", pg)
 
     def __getattr__(self, name):
-        names = self.__dict__["_names"]
-        full = names.get(name)
-        if full is None:
+        if name.startswith("_"):
             raise AttributeError(name)
-        return getattr(self.__dict__["_obj"], full)
+        try:
+            return getattr(self._pg, name)
+        except AttributeError:
+            raise AttributeError(name)
 
     def __setattr__(self, name, value):
-        names = self.__dict__["_names"]
-        full = names.get(name)
-        if full is None:
-            raise AttributeError(name)
-        setattr(self.__dict__["_obj"], full, value)
+        if name == "_pg":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._pg, name, value)
 
     def prop(self, layout, name, **kwargs):
-        names = self.__dict__["_names"]
-        full = names.get(name)
-        if full is None:
+        if not hasattr(self._pg, name):
             print(
                 f"[XNeko] pref '{name}' not injected. "
                 f"Restart Blender if you just added preference_props."
             )
             return None
-        return layout.prop(self.__dict__["_obj"], full, **kwargs)
+        return layout.prop(self._pg, name, **kwargs)
 
     def __contains__(self, name):
-        return name in self.__dict__["_names"]
+        return hasattr(self._pg, name)
 
     def keys(self):
-        return self.__dict__["_names"].keys()
+        return [
+            k for k in self._pg.bl_rna.properties.keys()
+            if k not in ("name", "rna_type")
+        ]
 
 
 # ==================================================
 # UI scale helpers
 # ==================================================
+_ui_scale_cache = None
+
+
 def _get_ui_scale():
+    global _ui_scale_cache
+    if _ui_scale_cache is not None:
+        return _ui_scale_cache
     try:
-        return bpy.context.preferences.system.ui_scale
+        _ui_scale_cache = bpy.context.preferences.system.ui_scale
     except Exception:
-        return 1.0
+        _ui_scale_cache = 1.0
+    return _ui_scale_cache
 
 
 def _get_usable_width(context):
@@ -1026,11 +1171,7 @@ def _draw_preferences(self, context):
     header.label(text="Tools:")
 
     if self.tools_section_expanded:
-        groups = {}
-        for item in self.tool_toggles:
-            tool = core._TOOL_REGISTRY.get(item.tool_id)
-            gid = tool["group_id"] if tool else ""
-            groups.setdefault(gid or "(root)", []).append(item)
+        groups = _get_groups(self)
 
         if not groups:
             layout.label(text="No tools found", icon='INFO')
@@ -1045,8 +1186,7 @@ def _draw_preferences(self, context):
 
             widest_tab_px = 1
             for gid in all_gids:
-                display_text = gid.replace(".", " / ").replace("_", " ").title()
-                w = _estimate_tab_px(display_text)
+                w = _estimate_tab_px(_get_display_text(gid))
                 if w > widest_tab_px:
                     widest_tab_px = w
 
@@ -1073,19 +1213,22 @@ def _draw_preferences(self, context):
             ).delta = -1
 
             for gid in visible_gids:
-                display = gid.replace(".", " / ").replace("_", " ").title()
+                display = _get_display_text(gid)
                 is_active = (self.active_category == gid)
 
                 group_data = core._state.registered_groups.get(gid)
                 icon_info = group_data["icon"] if group_data else None
 
-                icon_name = core._get_group_icon(gid)
                 prefix = ""
-                if icon_info:
-                    if icon_info["type"] == "builtin":
-                        icon_name = icon_info["value"]
-                    elif icon_info["type"] == "text":
-                        prefix = f"{icon_info['value']} "
+                if icon_info is None:
+                    icon_name = core._get_group_icon(gid)
+                elif icon_info["type"] == "builtin":
+                    icon_name = icon_info["value"]
+                elif icon_info["type"] == "text":
+                    icon_name = "FILE_FOLDER"
+                    prefix = f"{icon_info['value']} "
+                else:
+                    icon_name = "FILE_FOLDER"
 
                 tab_row.operator(
                     "xneko.set_active_category",
@@ -1208,11 +1351,7 @@ def _draw_preferences(self, context):
     header.label(text="Links:", icon='BOOKMARKS')
 
     if self.links_section_expanded:
-        by_author = {}
-        for label, url, icon, author in LINKS:
-            by_author.setdefault(author, []).append((label, url, icon))
-
-        for author, items in by_author.items():
+        for author, items in _get_links_by_author().items():
             box = layout.box()
             box.label(text=author, icon='USER')
             grid = box.grid_flow(row_major=True, columns=2, even_columns=True)
@@ -1250,10 +1389,10 @@ XNekoPreferences = None
 def build_preferences_class(include_tool_props=True):
     """Build the dynamic AddonPreferences class.
 
-    When include_tool_props is False, per-tool preference props are
-    skipped entirely. Used as a last-resort fallback when registering
-    the full class fails: the addon itself still loads and the user
-    keeps every feature except the tool preference UI.
+    Returns (prefs_cls, pg_classes). The caller is responsible for
+    registering pg_classes before prefs_cls. When include_tool_props
+    is False, per-tool PG classes are skipped entirely and every
+    tool's _pref_pg_cls is reset to None.
     """
     annotations = {
         "panel_category": StringProperty(
@@ -1269,10 +1408,6 @@ def build_preferences_class(include_tool_props=True):
         "tool_toggles": CollectionProperty(type=XNekoToolToggle),
 
         "project_section_expanded": BoolProperty(default=False),
-
-        # Collapse states for the other preference sections. Defaults:
-        # Presets and Tools are always-open (used constantly), Links is
-        # collapsed (rarely needed after first look).
         "presets_section_expanded": BoolProperty(default=False),
         "tools_section_expanded": BoolProperty(default=False),
         "links_section_expanded": BoolProperty(default=False),
@@ -1299,9 +1434,6 @@ def build_preferences_class(include_tool_props=True):
             name="Preset",
             items=_preset_items,
             description="Preset to apply",
-            # 'items' is a callback, so 'default' must be an integer
-            # index, not an identifier. _preset_items always puts the
-            # sentinel at index 0, so 0 == NONE_PRESET_ID.
             default=0,
         ),
 
@@ -1330,75 +1462,19 @@ def build_preferences_class(include_tool_props=True):
         ),
     }
 
-    _reset_pref_prefixes()
+    pg_classes = []
 
-    if not include_tool_props:
-        # Strip fallback: no per-tool props, no _pref_names either.
-        # Tools that try to read their own prefs will get an empty
-        # namespace and should degrade gracefully.
+    if include_tool_props:
+        pg_entries = _build_tool_pg_classes()
+        for pg_cls, attr_name, _tool in pg_entries:
+            annotations[attr_name] = PointerProperty(type=pg_cls)
+            pg_classes.append(pg_cls)
+    else:
         for _tool in core._TOOL_REGISTRY.values():
-            _tool["_pref_names"] = {}
-        return type(
-            "XNekoPreferences",
-            (bpy.types.AddonPreferences,),
-            {
-                "bl_idname": __package__,
-                "__annotations__": annotations,
-                "draw": _draw_preferences,
-            },
-        )
+            _tool["_pref_pg_cls"] = None
+            _tool["_pref_pg_attr"] = None
 
-    for full_id, tool in core._TOOL_REGISTRY.items():
-        prefix = _make_pref_prefix(full_id)
-        actual_tool_id = tool.get("tool_id", full_id)
-        names = {}
-        for name, prop in tool.get("preference_props", {}).items():
-            # Reject anything that is not a real bpy.props property.
-            # A single bad prop would make the whole dynamically-built
-            # XNekoPreferences class fail to register, taking the entire
-            # addon down with it. Drop the bad one and keep going.
-            if not _is_property_like(prop):
-                core._state.registration_issues.append({
-                    "type": "invalid_pref_prop",
-                    "tool_id": actual_tool_id,
-                    "paths": [
-                        f"{full_id}.preference_props['{name}']"
-                    ],
-                    "error": (
-                        f"value is {type(prop).__name__}, expected a "
-                        f"bpy.props property (e.g. BoolProperty())"
-                    ),
-                })
-                print(
-                    f"[XNeko] dropped preference_props['{name}'] of "
-                    f"{actual_tool_id}: not a bpy.props property"
-                )
-
-                mod = tool.get("module")
-                mod_file = (
-                    getattr(mod, "__file__", None) if mod else None
-                )
-
-                _reports.report_tool_error(
-                    "invalid preference prop dropped",
-                    extra={
-                        "tool_id": actual_tool_id,
-                        "name": name,
-                        "value_type": type(prop).__name__,
-                        "file": mod_file,
-                        "field": "preference_props",
-                        "line": core.find_assignment_line(
-                            mod_file, "preference_props"
-                        ),
-                    },
-                )
-                continue
-            full = prefix + name
-            names[name] = full
-            annotations[full] = prop
-        tool["_pref_names"] = names
-
-    return type(
+    prefs_cls = type(
         "XNekoPreferences",
         (bpy.types.AddonPreferences,),
         {
@@ -1408,15 +1484,114 @@ def build_preferences_class(include_tool_props=True):
         },
     )
 
+    return prefs_cls, pg_classes
+
+
+def install_preferences():
+    """Build and register XNekoPreferences plus every tool PG class.
+
+    Returns the registered prefs class, or None when no usable class
+    could be registered.
+    """
+    global XNekoPreferences, _registered_pg_classes
+
+    uninstall_preferences()
+    _invalidate_prefs_cache()
+
+    prefs_cls, pg_classes = build_preferences_class()
+
+    registered_pg = []
+    for pg_cls in pg_classes:
+        try:
+            bpy.utils.register_class(pg_cls)
+            registered_pg.append(pg_cls)
+        except Exception as e:
+            print(f"[XNeko] PG class {pg_cls.__name__} failed: {e}")
+
+    _registered_pg_classes = registered_pg
+
+    try:
+        bpy.utils.register_class(prefs_cls)
+    except Exception as e:
+        print(f"[XNeko] XNekoPreferences registration failed: {e}")
+        print("[XNeko] retrying without per-tool preference props")
+        _reports.report_critical_error(
+            "XNekoPreferences registration failed",
+            exc=e,
+            extra={"fallback": "include_tool_props=False"},
+        )
+        for pg_cls in reversed(registered_pg):
+            try:
+                bpy.utils.unregister_class(pg_cls)
+            except Exception:
+                pass
+        _registered_pg_classes = []
+        _invalidate_prefs_cache()
+
+        prefs_cls2, _ = build_preferences_class(include_tool_props=False)
+        try:
+            bpy.utils.register_class(prefs_cls2)
+            XNekoPreferences = prefs_cls2
+            return prefs_cls2
+        except Exception as e2:
+            print(f"[XNeko] fallback registration also failed: {e2}")
+            XNekoPreferences = None
+            return None
+
+    XNekoPreferences = prefs_cls
+    return prefs_cls
+
+
+def uninstall_preferences():
+    """Unregister XNekoPreferences and every tool PG class."""
+    global XNekoPreferences, _registered_pg_classes
+
+    if XNekoPreferences is not None:
+        try:
+            bpy.utils.unregister_class(XNekoPreferences)
+        except Exception:
+            pass
+        XNekoPreferences = None
+
+    for pg_cls in reversed(_registered_pg_classes):
+        try:
+            bpy.utils.unregister_class(pg_cls)
+        except Exception:
+            pass
+    _registered_pg_classes = []
+    _invalidate_prefs_cache()
+
+
+_cached_prefs_obj = None
+
+
+def _get_prefs_obj():
+    global _cached_prefs_obj
+    if _cached_prefs_obj is not None:
+        return _cached_prefs_obj
+    addon = bpy.context.preferences.addons.get(__package__)
+    if not addon:
+        return None
+    _cached_prefs_obj = addon.preferences
+    return _cached_prefs_obj
+
+
+def _invalidate_prefs_cache():
+    global _cached_prefs_obj
+    _cached_prefs_obj = None
+
 
 def _make_tool_namespace(tool):
-    prefs = bpy.context.preferences.addons.get(__package__)
-    if not prefs:
+    prefs_obj = _get_prefs_obj()
+    if prefs_obj is None:
         return None
-    names = tool.get("_pref_names")
-    if not names:
+    attr = tool.get("_pref_pg_attr")
+    if not attr:
         return None
-    return _ToolPrefNamespace(prefs.preferences, names)
+    pg = getattr(prefs_obj, attr, None)
+    if pg is None:
+        return None
+    return _ToolPrefNamespace(pg)
 
 
 def get_tool_prefs(tool_id):
@@ -1609,55 +1784,10 @@ def hot_reload_tools():
     # 6. Register the new tool-owned preference classes.
     register_tool_preference_classes()
 
-    # 7. Rebuild the dynamic XNekoPreferences class.
-    #
-    # Build the new class first, before touching the old one. If the
-    # build itself raises, the old class is untouched and the addon
-    # stays fully functional.
-    global XNekoPreferences
-    old_cls = XNekoPreferences
-
-    try:
-        new_cls = build_preferences_class()
-    except Exception as e:
-        print(f"[XNeko] hot reload: preferences build failed: {e}")
-        return False, f"Preferences build failed: {e}"
-
-    # Build succeeded; safe to swap the classes now.
-    if old_cls is not None:
-        try:
-            bpy.utils.unregister_class(old_cls)
-        except Exception:
-            pass
-
-    try:
-        bpy.utils.register_class(new_cls)
-        XNekoPreferences = new_cls
-    except Exception as e:
-        print(f"[XNeko] hot reload: registration failed: {e}")
-        # Stripped fallback: skip per-tool props entirely.
-        try:
-            XNekoPreferences = build_preferences_class(
-                include_tool_props=False
-            )
-            bpy.utils.register_class(XNekoPreferences)
-        except Exception as e2:
-            print(f"[XNeko] hot reload: fallback failed too: {e2}")
-            # Last resort: put the old class back so the addon is not
-            # left without any preferences class.
-            if old_cls is not None:
-                try:
-                    bpy.utils.register_class(old_cls)
-                    XNekoPreferences = old_cls
-                    print(
-                        "[XNeko] hot reload: restored previous "
-                        "preferences class"
-                    )
-                except Exception as e3:
-                    print(
-                        f"[XNeko] hot reload: restore failed: {e3}"
-                    )
-            return False, f"Preferences rebuild failed: {e}"
+    # 7. Rebuild the dynamic XNekoPreferences class and tool PG classes.
+    new_cls = install_preferences()
+    if new_cls is None:
+        return False, "Preferences rebuild failed"
 
     # 8. Post-rebuild steps.
     #
@@ -1749,6 +1879,7 @@ def init_tool_toggles():
     finally:
         core.pop_toggle_suppress()
         _pop_suppress_session()
+    _invalidate_groups_cache()
 
 
 def load_enabled_tools():
@@ -1766,11 +1897,17 @@ def clear_tool_toggles():
     if not prefs:
         return
     prefs.preferences.tool_toggles.clear()
+    _invalidate_groups_cache()
 
 
 # ==================================================
 # Panel category refresh (with rollback)
 # ==================================================
+def _reset_panel_category_cache():
+    global _last_category
+    _last_category = None
+
+
 _last_category = None
 
 

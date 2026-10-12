@@ -714,28 +714,48 @@ def load_group_icon_preview(group_name, group_path, icon_value):
     return key
 
 
+_group_icon_decl_cache = {}   # path -> ((mtime_ns, size), value)
+
+
 def _read_group_icon_decl(init_file):
-    """Read `group_icon = "..."` from a file without executing it."""
+    """Read `group_icon = "..."` from a file without executing it.
+
+    Result is cached by (mtime_ns, size) so repeated discovery passes
+    skip the file read and AST parse unless the file actually changed.
+    """
     if not init_file or not os.path.isfile(init_file):
         return None
+    try:
+        st = os.stat(init_file)
+    except OSError:
+        return None
+
+    cache_key = (st.st_mtime_ns, st.st_size)
+    cached = _group_icon_decl_cache.get(init_file)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
+    value = None
     try:
         import ast
         with open(init_file, "r", encoding="utf-8") as handle:
             tree = ast.parse(handle.read(), filename=init_file)
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            names = [
+                t.id for t in node.targets if isinstance(t, ast.Name)
+            ]
+            if "group_icon" not in names:
+                continue
+            if isinstance(node.value, ast.Constant):
+                value = node.value.value
+                break
     except Exception:
-        return None
+        value = None
 
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        names = [
-            t.id for t in node.targets if isinstance(t, ast.Name)
-        ]
-        if "group_icon" not in names:
-            continue
-        if isinstance(node.value, ast.Constant):
-            return node.value.value
-    return None
+    _group_icon_decl_cache[init_file] = (cache_key, value)
+    return value
 
 
 def resolve_group_icon(group_name, group_path):
