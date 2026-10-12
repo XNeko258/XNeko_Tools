@@ -87,7 +87,7 @@ cause and fix.
 - [Development Guide](docs/DEVELOPMENT.md) — how to write tool modules,
   metadata fields, `tool_id` rules, group icons, error reporting, and
   version compatibility.
-- [Preset Guide](docs/PRESETS.md) — how to export, import, and apply
+- [Preset Guide](docs/) — how to export, import, and apply
   presets, how preference values are captured, and how project-embedded
   preferences work.
 - [Group Folder Guide](docs/GROUPS.md) — how group folders are named,

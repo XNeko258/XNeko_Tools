@@ -56,7 +56,7 @@ add-on. Users can see and apply them. Manage them through git.
   "format": "xneko_prefs",
   "version": 2,
   "name": "Rigging",
-  "plugin_version": "0.9.0",
+  "plugin_version": "0.9.5",
   "blender_version": "4.2.0",
   "tools": {
     "clean_groups": {
