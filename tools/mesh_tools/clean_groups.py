@@ -1,5 +1,4 @@
 import bpy
-import bmesh
 from bpy.props import BoolProperty
 
 
@@ -19,19 +18,18 @@ blender_version_min = (4, 0, 0)
 # captured by or applied from presets. They describe what the
 # current click of the button should do, not a persistent
 # configuration.
+#
+# Empty groups (no vertex assigned) are always removed. The option
+# below extends that to zero-weight groups, which some rigs keep
+# intentionally as reserved slots, so it defaults to off.
 # ------------------------------------------------------------
 scene_props = {
-    "xneko_clean_groups_empty": BoolProperty(
-        name="Remove Empty Groups",
-        description="Remove vertex groups that no vertex is assigned to",
-        default=True,
-    ),
-    "xneko_clean_groups_zero": BoolProperty(
-        name="Remove Zero-Weight Groups",
+    "xneko_clean_groups_include_zero": BoolProperty(
+        name="Zero-Weight Groups",
         description=(
-            "Remove vertex groups whose assigned vertices all have weight 0"
+            "Also remove groups whose vertices all have weight 0"
         ),
-        default=True,
+        default=False,
     ),
 }
 
@@ -39,33 +37,47 @@ scene_props = {
 # ============================================================
 # Helpers
 # ============================================================
-def _is_group_referenced(obj, vg_name):
+def _collect_referenced_groups(obj):
+    """Return the set of vertex-group names referenced by this
+    object's modifiers or shape keys.
+
+    Collected in one pass so the removal loop can do O(1) lookups
+    instead of rescanning modifiers per candidate group.
+    """
+    referenced = set()
+
     for mod in obj.modifiers:
-        if hasattr(mod, "vertex_group") and mod.vertex_group == vg_name:
-            return True
-        if hasattr(mod, "vertex_group_mass") and mod.vertex_group_mass == vg_name:
-            return True
+        # Most deform modifiers expose 'vertex_group'; a few (e.g.
+        # Smooth, Corrective Smooth) also expose 'vertex_group_mass'.
+        # Empty string means "no group assigned".
+        name = getattr(mod, "vertex_group", "")
+        if name:
+            referenced.add(name)
+        name = getattr(mod, "vertex_group_mass", "")
+        if name:
+            referenced.add(name)
 
     sk = getattr(obj.data, "shape_keys", None)
     if sk is not None:
         for kb in sk.key_blocks:
-            if kb.vertex_group == vg_name:
-                return True
-    return False
+            if kb.vertex_group:
+                referenced.add(kb.vertex_group)
+
+    return referenced
 
 
 def _scan_group_usage(obj):
-    """Return (empty_names, zero_weight_names) sets for obj."""
-    bm = bmesh.new()
-    bm.from_mesh(obj.data)
+    """Return (empty_names, zero_weight_names) sets for obj.
 
-    deform_layer = bm.verts.layers.deform.active
+    Reads weights from MeshVertex.groups instead of bmesh's deform
+    layer. The deform layer drops explicit 0.0 assignments, which
+    made zero-weight detection silently ineffective. MeshVertex
+    .groups preserves them.
+    """
     weight_map = {}
-    if deform_layer is not None:
-        for v in bm.verts:
-            for idx, weight in v[deform_layer].items():
-                weight_map.setdefault(idx, []).append(weight)
-    bm.free()
+    for v in obj.data.vertices:
+        for ge in v.groups:
+            weight_map.setdefault(ge.group, []).append(ge.weight)
 
     empty, zero = set(), set()
     for vg in obj.vertex_groups:
@@ -90,31 +102,28 @@ class Mesh_OT_remove_empty_vertex_groups(bpy.types.Operator):
         if context.mode not in {'OBJECT', 'EDIT_MESH', 'PAINT_WEIGHT'}:
             return False
 
-        meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        meshes = [
+            o for o in (context.selected_objects or [])
+            if o.type == 'MESH'
+        ]
         if not meshes:
             active = context.object
             if active is None or active.type != 'MESH':
                 return False
             meshes = [active]
 
-        if not any(len(o.vertex_groups) > 0 for o in meshes):
-            return False
-
-        scene = context.scene
-        if not (scene.xneko_clean_groups_empty
-                or scene.xneko_clean_groups_zero):
-            return False
-        return True
+        # If every candidate has no groups at all, there is nothing
+        # this operator could do.
+        return any(len(o.vertex_groups) > 0 for o in meshes)
 
     def execute(self, context):
         scene = context.scene
-        clean_empty = bool(scene.xneko_clean_groups_empty)
-        clean_zero_weight = bool(scene.xneko_clean_groups_zero)
-        if not (clean_empty or clean_zero_weight):
-            self.report({'ERROR'}, "Enable at least one cleanup option")
-            return {'CANCELLED'}
+        include_zero = bool(scene.xneko_clean_groups_include_zero)
 
-        targets = [o for o in context.selected_objects if o.type == 'MESH']
+        targets = [
+            o for o in (context.selected_objects or [])
+            if o.type == 'MESH'
+        ]
         if not targets:
             active = context.object
             if active is not None and active.type == 'MESH':
@@ -127,17 +136,24 @@ class Mesh_OT_remove_empty_vertex_groups(bpy.types.Operator):
         total_objects = 0
         for obj in targets:
             empty_names, zero_names = _scan_group_usage(obj)
-            to_remove = set()
-            if clean_empty:
-                to_remove |= empty_names
-            if clean_zero_weight:
+
+            # Empty groups are always cleaned; zero-weight groups
+            # only when the user opts in.
+            to_remove = set(empty_names)
+            if include_zero:
                 to_remove |= zero_names
+
+            if not to_remove:
+                continue
+
+            referenced = _collect_referenced_groups(obj)
+            vg_map = {vg.name: vg for vg in obj.vertex_groups}
 
             removed = 0
             for name in to_remove:
-                if _is_group_referenced(obj, name):
+                if name in referenced:
                     continue
-                vg = obj.vertex_groups.get(name)
+                vg = vg_map.get(name)
                 if vg is not None:
                     obj.vertex_groups.remove(vg)
                     removed += 1
@@ -167,22 +183,12 @@ class VIEW3D_PT_vertex_group_tools(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
 
-        box = layout.box()
-        box.label(text="Clean Options:", icon='TRASH')
-
-        # scene is a real RNA object, so plain layout.prop is correct here.
-        box.prop(scene, "xneko_clean_groups_empty")
-        box.prop(scene, "xneko_clean_groups_zero")
-
-        if not (scene.xneko_clean_groups_empty
-                or scene.xneko_clean_groups_zero):
-            row = box.row()
-            row.alert = True
-            row.label(text="Check at least one option", icon='INFO')
+        # Option first, so its effect on the button below is obvious.
+        layout.prop(scene, "xneko_clean_groups_include_zero")
 
         layout.operator(
             "xneko.remove_empty_vertex_groups",
-            text="Clean Groups",
+            text="Clean Empty Groups",
             icon='GROUP_VERTEX',
         )
 

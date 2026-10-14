@@ -16,6 +16,18 @@ positioned in ways that do not match the rigging workflow. Fixing
 hundreds of bones one at a time in Edit Mode is impractical, so
 this tool batch-edits them by a fixed angle around a common pivot.
 
+## Clean Vertex Groups
+
+- **tool_id**: `clean_groups`
+- **What it does**:
+  Removes unused vertex groups from mesh objects. Empty groups are
+  always cleaned; check `Zero-Weight Groups` to also remove groups
+  whose vertices all have weight 0. Groups referenced by modifiers
+  or shape keys are kept.
+- **Why it exists**:
+  Merged and imported meshes pile up dead vertex groups. This clears
+  them in one click, without breaking deform setups.
+
 ## Shape Key Plus
 
 - **tool_id:** `shape_key_plus`
