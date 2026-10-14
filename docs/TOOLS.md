@@ -63,8 +63,7 @@ this tool batch-edits them by a fixed angle around a common pivot.
   normally means deleting and recreating them by hand. This swaps
   them in place in one click. Inspired by the "Apply Selected
   Shapekey to Basis" feature from
-  [Cats Blender Plugin](https://github.com/teamneoneko/Cats-Blender-Plugin)
-  (no longer maintained).
+  [Cats Blender Plugin](https://github.com/teamneoneko/Cats-Blender-Plugin).
 
 ## Shape Key Plus
 
