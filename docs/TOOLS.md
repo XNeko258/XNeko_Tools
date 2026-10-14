@@ -28,6 +28,16 @@ this tool batch-edits them by a fixed angle around a common pivot.
   Merged and imported meshes pile up dead vertex groups. This clears
   them in one click, without breaking deform setups.
 
+## Sync Data Names
+
+- **tool_id**: `sync_names`
+- **What it does**:
+  Renames each selected object's data block to match the object name.
+  Shape key data is renamed too, so the whole chain stays consistent.
+- **Why it exists**:
+  Duplicated objects often keep stale data names, which is confusing
+  in the outliner and in exports. This aligns them in one click.
+
 ## Rename Modifiers
 
 - **tool_id**: `rename_modifiers`
