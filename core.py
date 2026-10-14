@@ -643,10 +643,13 @@ def is_image_path(value):
     return value.lower().endswith(IMAGE_EXTENSIONS)
 
 
-def is_builtin_icon(name):
-    if not name or not isinstance(name, str):
-        return False
+_builtin_icon_cache = None
 
+
+def _get_builtin_icons():
+    global _builtin_icon_cache
+    if _builtin_icon_cache is not None:
+        return _builtin_icon_cache
     enum_items = None
     try:
         enum_items = (
@@ -655,20 +658,27 @@ def is_builtin_icon(name):
         )
     except Exception:
         enum_items = None
-
     if enum_items is None:
         try:
             enum_items = bpy.types.UILayout.bl_rna.properties["icon"].enum_items
         except Exception:
             enum_items = None
-
     if enum_items is None:
-        return False
+        _builtin_icon_cache = frozenset()
+    else:
+        try:
+            _builtin_icon_cache = frozenset(
+                item.identifier for item in enum_items
+            )
+        except Exception:
+            _builtin_icon_cache = frozenset()
+    return _builtin_icon_cache
 
-    try:
-        return name in enum_items
-    except Exception:
+
+def is_builtin_icon(name):
+    if not name or not isinstance(name, str):
         return False
+    return name in _get_builtin_icons()
 
 
 def load_group_icon_preview(group_name, group_path, icon_value):
@@ -944,6 +954,55 @@ def attach_panels_to_groups(tool=None):
 # ============================================================
 # Load / unload
 # ============================================================
+def _teardown_tool_registration(tool):
+    """Unregister a tool's classes, scene props, and drop its module.
+
+    Safe to call from both unload_tool() and the on_load failure
+    path. Does not touch tool['loaded'] or the group counter; those
+    are the caller's responsibility so the two call sites stay in
+    sync.
+    """
+    # Scene props injected by this tool
+    for name in tool.get("_loaded_scene_props", ()):
+        try:
+            delattr(bpy.types.Scene, name)
+        except Exception:
+            pass
+
+    tool["_loaded_scene_props"] = []
+
+    # Non-PropertyGroup classes first (operators, panels, ...)
+    for cls in reversed(tool["classes"]):
+        if (isinstance(cls, type)
+                and not issubclass(cls, bpy.types.PropertyGroup)):
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                pass
+
+    # PropertyGroup classes last
+    for cls in reversed(tool["classes"]):
+        if isinstance(cls, type) and issubclass(cls, bpy.types.PropertyGroup):
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                pass
+
+    # Drop the module cache for this tool subtree
+    module_name = tool["module_name"]
+    prefix = module_name + "."
+    for mod_name in list(sys.modules):
+        if mod_name == module_name or mod_name.startswith(prefix):
+            sys.modules.pop(mod_name, None)
+
+    tool["module"] = None
+    tool["classes"] = ()
+    tool["scene_props"] = {}
+    tool["on_load"] = None
+    tool["on_unload"] = None
+    tool["draw_preferences"] = None
+
+
 def load_tool(tool_id):
     tool = _TOOL_REGISTRY.get(tool_id)
     if not tool or tool["loaded"]:
@@ -963,12 +1022,17 @@ def load_tool(tool_id):
 
         tool["module"] = module
         tool["classes"] = tuple(getattr(module, "classes", ()))
+        tool["preference_classes"] = tuple(
+            getattr(module, "preference_classes", ())
+        )
         tool["scene_props"] = dict(getattr(module, "scene_props", {}))
         tool["on_load"] = getattr(module, "on_load", None)
         tool["on_unload"] = getattr(module, "on_unload", None)
+        tool["draw_preferences"] = getattr(module, "draw_preferences", None)
 
     attach_panels_to_groups(tool)
 
+    # PropertyGroup classes
     for cls in tool["classes"]:
         if isinstance(cls, type) and issubclass(cls, bpy.types.PropertyGroup):
             try:
@@ -977,6 +1041,7 @@ def load_tool(tool_id):
                 print(f"[XNeko] register PropertyGroup "
                       f"{cls.__name__} failed: {e}")
 
+    # Non-PropertyGroup classes
     for cls in tool["classes"]:
         if isinstance(cls, type) and not issubclass(cls, bpy.types.PropertyGroup):
             try:
@@ -984,14 +1049,15 @@ def load_tool(tool_id):
             except Exception as e:
                 print(f"[XNeko] register {cls.__name__} failed: {e}")
 
-    # Isolate Scene prop injection: a malformed scene_prop (e.g. a
-    # plain string instead of a bpy.props property) would otherwise
-    # raise here and abort load_tool, leaving the tool half-loaded.
+    # Scene prop injection. Track which ones actually succeeded so
+    # unload never deletes a prop that was never injected.
     tool_file = getattr(tool["module"], "__file__", None)
+    loaded_names = []
 
     for name, prop in tool["scene_props"].items():
         try:
             setattr(bpy.types.Scene, name, prop)
+            loaded_names.append(name)
         except Exception as e:
             print(f"[XNeko] Scene.{name} for {tool_id} failed: {e}")
             _reports.report_tool_error(
@@ -1008,14 +1074,38 @@ def load_tool(tool_id):
                 },
             )
 
+    tool["_loaded_scene_props"] = loaded_names
+
+    # Mark loaded before on_load so the group counter and unload
+    # path stay consistent if on_load fails.
+    tool["loaded"] = True
+    _group_loaded_inc(tool["group_id"])
+
     if callable(tool["on_load"]):
         try:
             tool["on_load"]()
         except Exception as e:
-            print(f"[XNeko] on_load for {tool_id} failed: {e}")
-
-    tool["loaded"] = True
-    _group_loaded_inc(tool["group_id"])
+            print(f"[XNeko] on_load for {tool_id} failed, rolling back: {e}")
+            _reports.report_tool_error(
+                "on_load failed, tool unloaded",
+                exc=e,
+                extra={"tool_id": tool_id},
+            )
+            # Give the tool a chance to clean up whatever on_load
+            # partially installed before we tear down. Guarded so a
+            # second failure here cannot mask the original one.
+            if callable(tool["on_unload"]):
+                try:
+                    tool["on_unload"]()
+                except Exception as unload_exc:
+                    print(
+                        f"[XNeko] on_unload during rollback for "
+                        f"{tool_id} failed: {unload_exc}"
+                    )
+            _group_loaded_dec(tool["group_id"])
+            _teardown_tool_registration(tool)
+            tool["loaded"] = False
+            return
 
 
 def unload_tool(tool_id):
@@ -1029,45 +1119,8 @@ def unload_tool(tool_id):
         except Exception as e:
             print(f"[XNeko] on_unload for {tool_id} failed: {e}")
 
-    for name in tool["scene_props"]:
-        try:
-            delattr(bpy.types.Scene, name)
-        except Exception:
-            pass
-
     _group_loaded_dec(tool["group_id"])
-
-    # Unregister non-PropertyGroup classes first so no registered
-    # operator or panel is left referencing an unregistered
-    # PropertyGroup.
-    for cls in reversed(tool["classes"]):
-        if (isinstance(cls, type)
-                and not issubclass(cls, bpy.types.PropertyGroup)):
-            try:
-                bpy.utils.unregister_class(cls)
-            except Exception:
-                pass
-
-    for cls in reversed(tool["classes"]):
-        if isinstance(cls, type) and issubclass(cls, bpy.types.PropertyGroup):
-            try:
-                bpy.utils.unregister_class(cls)
-            except Exception:
-                pass
-
-    module_name = tool["module_name"]
-    tool["module"] = None
-
-    prefix = module_name + "."
-    for mod_name in list(sys.modules):
-        if mod_name == module_name or mod_name.startswith(prefix):
-            sys.modules.pop(mod_name, None)
-
-    tool["classes"] = ()
-    tool["scene_props"] = {}
-    tool["on_load"] = None
-    tool["on_unload"] = None
-
+    _teardown_tool_registration(tool)
     tool["loaded"] = False
 
 
@@ -1083,8 +1136,8 @@ def set_tool_enabled(tool_id, enabled):
 
     if enabled:
         load_tool(tool_id)
-    else:
-        unload_tool(tool_id)
+        return bool(tool["loaded"])
+    unload_tool(tool_id)
     return True
 
 

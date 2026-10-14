@@ -108,7 +108,7 @@ _groups_cache_key = None
 
 def _get_groups(prefs_obj):
     global _groups_cache, _groups_cache_key
-    key = len(prefs_obj.tool_toggles)
+    key = tuple(it.tool_id for it in prefs_obj.tool_toggles)
     if _groups_cache_key == key and _groups_cache is not None:
         return _groups_cache
 
@@ -348,7 +348,7 @@ def _full_id_map():
 def _set_tool_enabled(tool_id, enabled):
     """Route to core.set_tool_enabled, which performs compatibility
     checks and syncs load/unload."""
-    core.set_tool_enabled(tool_id, enabled)
+    return bool(core.set_tool_enabled(tool_id, enabled))
 
 
 def _redraw_view3d(context=None):
@@ -503,7 +503,7 @@ class XNekoToolToggle(bpy.types.PropertyGroup):
     display_name: StringProperty()
     enabled: BoolProperty(
         default=True,
-        update=lambda self, ctx: _on_toggle(self),
+        update=lambda self, ctx: _on_toggle(self, ctx),
     )
     expanded: BoolProperty(default=False)
 
@@ -1608,7 +1608,7 @@ def get_tool_prefs(tool_id):
 _toggle_in_progress = False
 
 
-def _on_toggle(item):
+def _on_toggle(item, context=None):
     global _toggle_in_progress
     if _toggle_in_progress:
         return
@@ -1630,8 +1630,14 @@ def _on_toggle(item):
             # suppressed by the guard, so persist the rejection here.
             _write_session()
             return
-        _set_tool_enabled(item.tool_id, item.enabled)
-        _redraw_view3d()
+        ok = _set_tool_enabled(item.tool_id, item.enabled)
+        if not ok and item.enabled:
+            # Load failed: flip the checkbox back so the UI never
+            # shows "enabled" for a tool that is not running.
+            item.enabled = False
+            print(f"[XNeko] {item.tool_id} failed to load; "
+                  f"toggle reverted")
+        _redraw_view3d(context)
         _write_session()
     finally:
         _toggle_in_progress = False
@@ -1775,11 +1781,26 @@ def hot_reload_tools():
         print(f"[XNeko] hot reload: pref class teardown failed: {e}")
 
     # 5. Re-discover every tool.
+    #
+    # A failure here leaves the registry in whatever state discovery
+    # reached (possibly empty). Do not abort: continue to rebuild
+    # preferences so the user sees the current state in the UI and
+    # can hot-reload again after fixing the underlying issue,
+    # instead of being forced to restart Blender.
     try:
         core._initialize_tools()
     except Exception as e:
         print(f"[XNeko] hot reload: discovery failed: {e}")
-        return False, f"Discovery failed: {e}"
+        _reports.report_critical_error(
+            "hot reload: discovery failed",
+            exc=e,
+            extra={
+                "effect": (
+                    "tool registry may be empty or partial; "
+                    "fix the issue and hot-reload again"
+                ),
+            },
+        )
 
     # 6. Register the new tool-owned preference classes.
     register_tool_preference_classes()

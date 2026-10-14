@@ -4,7 +4,7 @@
 bl_info = {
     "name": "XNeko Tools",
     "author": "XNeko, Shao qin",
-    "version": (0, 9, 5),
+    "version": (0, 9, 6),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > XNeko Tools",
     "description": (

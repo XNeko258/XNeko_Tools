@@ -54,7 +54,12 @@ _critical_dedup = set()
 # addon.preferences is unavailable and the user toggle cannot be
 # read. Those reports are queued here and flushed by flush_pending()
 # once preferences become available.
+#
+# Bounded so a pathological discovery pass (hundreds of broken
+# tool modules) cannot grow the queue without limit. Oldest entries
+# are dropped first.
 _pending_reports = []
+_MAX_PENDING = 50
 
 
 # ------------------------------------------------------------
@@ -292,6 +297,8 @@ def report_tool_error(label, exc=None, extra=None):
     state = is_user_reporting_enabled()
     if state is None:
         # Preferences not ready. Queue and let register() flush.
+        if len(_pending_reports) >= _MAX_PENDING:
+            _pending_reports.pop(0)
         _pending_reports.append((label, exc, extra))
         return None
     if not state:
