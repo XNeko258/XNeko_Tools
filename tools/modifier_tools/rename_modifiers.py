@@ -1,6 +1,6 @@
 import bpy
 from bpy.props import StringProperty, CollectionProperty, BoolProperty
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 
 # ------------------------------------------------------------
@@ -86,6 +86,7 @@ class SelectionInfo(NamedTuple):
     has_armature_target: bool
     has_mask_target: bool
     has_hook_target: bool
+    has_nodes_target: bool
 
 
 # ============================================================
@@ -120,80 +121,18 @@ class XNEKO_ModPref(bpy.types.PropertyGroup):
     )
 
 
-def _get_selected_pose_bones(context):
-    """Return the set of selected pose bones, or None when not in Pose Mode.
-
-    None  -> no filter (process all bones)
-    set() -> Pose Mode, nothing selected (process no bones)
-    """
-    try:
-        if context.mode == 'POSE':
-            selected_objs = set(context.selected_objects)
-            return {
-                pb for pb in (context.selected_pose_bones or [])
-                if pb.id_data in selected_objs
-            }
-    except Exception:
-        pass
-    return None
-
-
-def _get_selected_pose_bones(context):
-    """Return selected pose bones, or None when not in Pose Mode.
-
-    None  -> no filter (process every bone)
-    set() -> Pose Mode with no bone selected (process no bone constraints)
-    """
-    try:
-        if context.mode == 'POSE':
-            selected_objs = set(context.selected_objects)
-            return {
-                pb for pb in (context.selected_pose_bones or [])
-                if pb.id_data in selected_objs
-            }
-    except Exception:
-        pass
-    return None
-
-
-def _get_selected_pose_bones(context, mode='ALL'):
-    """Decide which pose bones to filter by.
-
-    Returns None  -> no filter (process every pose bone of the armature)
-    Returns set() -> only process pose bones in this set
-
-    mode == 'ALL'      : always None
-    mode == 'SELECTED' : Pose Mode -> selected bones;
-                         otherwise  -> None (fall back to all)
-    """
-    if mode != 'SELECTED':
-        return None
-
-    if context.mode != 'POSE':
-        # Not in Pose Mode: no bone-level selection concept, fall back to all
-        return None
-
-    try:
-        selected_objs = set(context.selected_objects)
-        return {
-            pb for pb in (context.selected_pose_bones or [])
-            if pb.id_data in selected_objs
-        }
-    except Exception:
-        return None
-
-
 # ============================================================
 # Scan helpers
 # ============================================================
 def scan_selection(context) -> SelectionInfo:
-    objects = list(context.selected_objects)
+    objects = list(context.selected_objects or [])
 
     pairs = []
     types = set()
     has_arm = False
     has_mask = False
     has_hook = False
+    has_nodes = False
 
     for obj in objects:
         mods = getattr(obj, 'modifiers', None)
@@ -202,12 +141,18 @@ def scan_selection(context) -> SelectionInfo:
         for mod in mods:
             pairs.append((obj, mod))
             types.add(mod.type)
+            # Skip the flag checks once all four are set: on rigs
+            # with hundreds of modifiers this trims the inner loop
+            # to the two cheap operations above.
+            if has_arm and has_mask and has_hook and has_nodes:
+                continue
             if not has_arm and mod.type == 'ARMATURE' and mod.object:
                 has_arm = True
             if not has_mask and mod.type == 'MASK' and mod.vertex_group:
                 has_mask = True
-            if not has_hook and mod.type == 'HOOK' and mod.object:
-                has_hook = True
+            if not has_nodes and mod.type == 'NODES':
+                if getattr(mod, 'node_group', None) is not None:
+                    has_nodes = True
 
     return SelectionInfo(
         pairs=tuple(pairs),
@@ -217,6 +162,7 @@ def scan_selection(context) -> SelectionInfo:
         has_armature_target=has_arm,
         has_mask_target=has_mask,
         has_hook_target=has_hook,
+        has_nodes_target=has_nodes,
     )
 
 
@@ -224,13 +170,24 @@ _VALID_ICONS_CACHE = None
 
 
 def _get_valid_icons():
+    """Return the set of valid icon identifiers.
+
+    Uses the same iteration form as core._get_builtin_icons: iterating
+    enum_items and reading .identifier works across 4.0-5.x, while
+    .keys() is not guaranteed to exist on every build.
+    """
     global _VALID_ICONS_CACHE
     if _VALID_ICONS_CACHE is None:
+        icons = set()
         try:
-            props = bpy.types.UILayout.bl_rna.functions['label'].parameters['icon']
-            _VALID_ICONS_CACHE = set(props.enum_items.keys())
+            enum_items = (
+                bpy.types.UILayout.bl_rna.functions['label']
+                .parameters['icon'].enum_items
+            )
+            icons = {item.identifier for item in enum_items}
         except Exception:
-            _VALID_ICONS_CACHE = set()
+            icons = set()
+        _VALID_ICONS_CACHE = icons
     return _VALID_ICONS_CACHE
 
 
@@ -243,31 +200,51 @@ def safe_icon(mtype: str) -> str:
 
 
 def has_any_modifier(context) -> bool:
-    for obj in context.selected_objects:
+    for obj in (context.selected_objects or []):
         if getattr(obj, 'modifiers', None):
             return True
     return False
 
 
-def get_pref(prefs, mod_type: str) -> Optional['XNEKO_ModPref']:
-    for p in prefs:
-        if p.mod_type == mod_type:
-            return p
-    return None
+def build_pref_map(prefs) -> dict:
+    """Return {mod_type: XNEKO_ModPref}.
+
+    Used by rename_mods and the panel draw so both avoid the O(n*m)
+    scan that get_pref performs per lookup.
+    """
+    return {p.mod_type: p for p in prefs}
 
 
 # ============================================================
 # Pre-population
 # ============================================================
-def ensure_prefs_for_scene(scene) -> None:
+def ensure_prefs_for_scene(scene) -> bool:
+    """Populate default prefs for a scene.
+
+    Returns True if the prefs are ready to use, False if the
+    current context forbids writing to Scene data (e.g. inside a
+    panel draw callback). Callers should not rely on the return
+    value for correctness, only for UI hints.
+    """
     prefs = getattr(scene, 'xneko_mod_prefs', None)
     if prefs is None:
-        return
+        return False
+
     existing = {p.mod_type for p in prefs}
-    for mtype in DEFAULT_MOD_NAMES:
-        if mtype not in existing:
+    missing = [m for m in DEFAULT_MOD_NAMES if m not in existing]
+    if not missing:
+        return True
+
+    try:
+        for mtype in missing:
             p = prefs.add()
             p.mod_type = mtype
+        return True
+    except Exception:
+        # Blender forbids modifying ID data from a draw callback.
+        # Leave the collection partial and let the operator fill it
+        # in when the user actually clicks Rename.
+        return False
 
 
 @bpy.app.handlers.persistent
@@ -277,6 +254,46 @@ def _on_load_post(_dummy):
             ensure_prefs_for_scene(scene)
     except Exception as e:
         print(f"[XNeko] load_post prepopulate failed: {e}")
+
+
+# ------------------------------------------------------------
+# Deferred initialization
+# ------------------------------------------------------------
+# Panel draw callbacks run inside a context where Blender forbids
+# writing to ID data. If a scene has never been populated (new
+# scene, or a fresh .blend that skipped load_post), the panel
+# schedules a timer that fills the prefs one frame later. The user
+# sees the settings appear automatically without ever noticing.
+# ------------------------------------------------------------
+_pending_init_scenes = set()
+_init_timer_registered = False
+
+
+def _init_timer():
+    global _init_timer_registered
+    _init_timer_registered = False
+
+    for name in list(_pending_init_scenes):
+        scene = bpy.data.scenes.get(name)
+        if scene is not None:
+            ensure_prefs_for_scene(scene)
+    _pending_init_scenes.clear()
+    return None  # one-shot
+
+
+def _schedule_init(scene_name):
+    global _init_timer_registered
+    _pending_init_scenes.add(scene_name)
+    if _init_timer_registered:
+        return
+    try:
+        bpy.app.timers.register(_init_timer, first_interval=0.0)
+        _init_timer_registered = True
+    except Exception:
+        # Timer could not be registered (background mode, timer
+        # queue full, etc). Leave the flag off so the next draw
+        # retries instead of silently never initializing.
+        _init_timer_registered = False
 
 
 # ============================================================
@@ -301,6 +318,10 @@ def _compute_name(mod, pref):
             return mod.object.name
         if mod.type == 'MASK' and mod.vertex_group:
             return mod.vertex_group
+        if mod.type == 'NODES':
+            ng = getattr(mod, 'node_group', None)
+            if ng is not None:
+                return ng.name
 
     return DEFAULT_MOD_NAMES.get(mod.type, mod.type.title())
 
@@ -311,12 +332,16 @@ def rename_mods(pairs, prefs):
     Returns (processed, collisions). Collisions are cases where
     Blender had to append a numeric suffix because the target name
     was already taken on the same object.
+
+    Builds the pref lookup once so per-modifier type resolution is
+    O(1) instead of O(len(prefs)).
     """
+    pref_map = build_pref_map(prefs)
     processed = 0
     collisions = 0
 
     for _obj, mod in pairs:
-        pref = get_pref(prefs, mod.type)
+        pref = pref_map.get(mod.type)
         if pref is not None and not pref.enabled:
             continue
 
@@ -370,6 +395,15 @@ def draw_modifier_row(layout, entry, mtype, info):
 
         inp = right.row(align=True)
         inp.enabled = not (entry.follow_target and info.has_mask_target)
+        inp.prop(entry, "custom_name", text="", icon='SORTALPHA')
+
+    elif mtype == 'NODES':
+        cb = right.row(align=True)
+        cb.enabled = info.has_nodes_target
+        cb.prop(entry, "follow_target", text="Follow Node Group")
+
+        inp = right.row(align=True)
+        inp.enabled = not (entry.follow_target and info.has_nodes_target)
         inp.prop(entry, "custom_name", text="", icon='SORTALPHA')
 
     else:
@@ -483,9 +517,12 @@ class VIEW3D_PT_xneko_rename_modifiers(bpy.types.Panel):
             return
 
         # Case 3: normal
-        ensure_prefs_for_scene(scene)
-
+        # Do NOT call ensure_prefs_for_scene here. Blender forbids
+        # writing to Scene data from a draw callback. The collection
+        # is populated by the load_post handler, and the operator
+        # fills it in on first click when needed.
         mod_prefs = scene.xneko_mod_prefs
+        pref_map = build_pref_map(mod_prefs)
         info = scan_selection(context)
 
         layout.label(
@@ -499,11 +536,18 @@ class VIEW3D_PT_xneko_rename_modifiers(bpy.types.Panel):
 
         layout.separator()
 
-        for mtype in sorted(info.types_in_use):
-            entry = get_pref(mod_prefs, mtype)
-            if entry is None:
-                continue
-            draw_modifier_row(layout, entry, mtype, info)
+        if not pref_map:
+            # Queue a one-frame deferred init. Next redraw will see
+            # the populated collection and draw normally.
+            _schedule_init(scene.name)
+            box = layout.box()
+            box.label(text="Initializing settings...", icon='INFO')
+        else:
+            for mtype in sorted(info.types_in_use):
+                entry = pref_map.get(mtype)
+                if entry is None:
+                    continue
+                draw_modifier_row(layout, entry, mtype, info)
 
         layout.separator()
 
@@ -555,5 +599,16 @@ def on_load():
 
 
 def on_unload():
+    global _init_timer_registered
+
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)
+
+    if _init_timer_registered:
+        try:
+            bpy.app.timers.unregister(_init_timer)
+        except Exception:
+            pass
+        _init_timer_registered = False
+
+    _pending_init_scenes.clear()

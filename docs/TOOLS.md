@@ -28,6 +28,18 @@ this tool batch-edits them by a fixed angle around a common pivot.
   Merged and imported meshes pile up dead vertex groups. This clears
   them in one click, without breaking deform setups.
 
+## Rename Modifiers
+
+- **tool_id**: `rename_modifiers`
+- **What it does**:
+  Batch-renames modifiers on selected objects. Armature, Hook, and
+  Mask modifiers can follow their target object or vertex group;
+  Geometry Nodes modifiers can follow their node group. Other types
+  use a default label. A custom name overrides all.
+- **Why it exists**:
+  Many modifiers with inconsistent names are hard to scan. This
+  normalizes them in one click.
+
 ## Shape Key Plus
 
 - **tool_id:** `shape_key_plus`
