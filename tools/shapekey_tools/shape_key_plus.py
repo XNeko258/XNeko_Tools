@@ -28,6 +28,12 @@ tool_id = "shape_key_plus"
 tool_name = "Shape Key Plus"
 tool_default_enabled = False
 
+# Minimum supported Blender version. All features work on 4.0+
+# except the name filter, whose search bar only exists from 4.5
+# onward. The filter degrades silently on 4.0 ~ 4.4; every other
+# feature remains fully functional.
+blender_version_min = (4, 0, 0)
+
 
 # =====================================================================
 # Tool preferences
@@ -38,9 +44,10 @@ preference_props = {
         name="Wheel Acceleration",
         description=(
             "Roll the wheel fast to move further per notch; roll it "
-            "slowly to fall back to Base Step"
+            "slowly to fall back to Base Step. Off by default so a "
+            "fast scroll never moves more rows than expected"
         ),
-        default=True,
+        default=False,
     ),
     "scroll_step": IntProperty(
         name="Base Step",
@@ -103,7 +110,7 @@ _cached_prefs = None
 # the effect. The button column next to the list is roughly 8 rows
 # tall when collapsed and 15 when expanded.
 _LIST_ROWS_BASE = 8
-_RENAME_EXTRA_ROWS = 7
+_RENAME_EXTRA_ROWS = 9
 
 
 def draw_preferences(layout, context, prefs):
@@ -116,7 +123,7 @@ def draw_preferences(layout, context, prefs):
     try:
         accel_on = bool(getattr(prefs, "wheel_acceleration"))
     except Exception:
-        accel_on = True
+        accel_on = False
 
     grid = col.grid_flow(row_major=True, columns=2, align=True)
     grid.use_property_split = True
@@ -217,11 +224,11 @@ def _read_accel_step():
 def _read_wheel_acceleration():
     prefs = _get_prefs()
     if prefs is None:
-        return True
+        return False
     try:
         return bool(prefs.wheel_acceleration)
     except Exception:
-        return True
+        return False
 
 
 def _read_wheel_fast_dt():
@@ -276,13 +283,12 @@ def _toggle_rename_expand():
     _rename_expand = not _rename_expand
 
 
-# The three per-object stores below are keyed by object name and are
-# never trimmed on deletion, so a long session with many created or
-# renamed objects would keep stale entries forever. `_maybe_prune_state`
-# is called from the panel draw and drops entries for objects that no
-# longer exist. The interval keeps the O(objects) scan rare.
-_maintenance_counter = 0
-_MAINTENANCE_INTERVAL = 200
+# The per-object stores below are keyed by object name and are never
+# trimmed on deletion, so a long session with many created or renamed
+# objects would keep stale entries forever. Pruning walks every object
+# in the file, so we hand it to a one-shot app timer instead of
+# running it from a panel draw, where it would stutter on large scenes.
+_maintenance_scheduled = False
 
 
 def _prune_state():
@@ -294,12 +300,22 @@ def _prune_state():
                 del store[key]
 
 
+def _run_prune_timer():
+    global _maintenance_scheduled
+    _maintenance_scheduled = False
+    _prune_state()
+    # Returning None tells the timer system this was a one-shot and
+    # should not be rescheduled.
+    return None
+
+
 def _maybe_prune_state():
-    global _maintenance_counter
-    _maintenance_counter += 1
-    if _maintenance_counter >= _MAINTENANCE_INTERVAL:
-        _maintenance_counter = 0
-        _prune_state()
+    """Schedule a prune pass if one is not already pending."""
+    global _maintenance_scheduled
+    if _maintenance_scheduled:
+        return
+    _maintenance_scheduled = True
+    bpy.app.timers.register(_run_prune_timer, first_interval=0.0)
 
 
 def _live_names(obj):
@@ -398,19 +414,64 @@ def _remove_blocked_by_lock(obj):
     if not blocks:
         return False
 
-    sel = _get_selection(obj)
-    sel.discard(blocks[0].name)   # Basis is never removable
-
-    if len(sel) >= 2:
-        targets = [kb for kb in blocks if kb.name in sel]
-    else:
-        # Single selection or none: the active key is the target.
+    # Fast path: no raw selection means the active key is the sole
+    # target, and that case never needs the O(N) live-name filter
+    # _get_selection performs. This is the common path during normal
+    # panel redraws. Basis is not special-cased here: if the user
+    # locked it, Remove should grey out the same way it would for
+    # any other locked row.
+    raw_sel = _selection.get(obj.name)
+    if not raw_sel:
         idx = obj.active_shape_key_index
-        if idx <= 0 or idx >= len(blocks):
+        if idx < 0 or idx >= len(blocks):
             return False
-        targets = [blocks[idx]]
+        return blocks[idx].lock_shape
 
-    return any(kb.lock_shape for kb in targets)
+    sel = raw_sel & _live_names(obj)
+    # Basis is excluded from the batch target set: the batch path
+    # deletes by index, and index 0 cannot be removed without
+    # invalidating the whole key data block. A single-click on Basis
+    # never reaches this branch (raw_sel is empty for it), so the
+    # user can still attempt it via the single-delete path, which
+    # matches the built-in panel.
+    sel.discard(blocks[0].name)
+    if len(sel) < 2:
+        idx = obj.active_shape_key_index
+        if idx < 0 or idx >= len(blocks):
+            return False
+        return blocks[idx].lock_shape
+
+    targets = [kb for kb in blocks if kb.name in sel]
+    # The batch-remove path skips locked keys and still deletes the
+    # unlocked ones, so it only fails when every target is locked.
+    # Using any() here would grey the button out for a mixed
+    # selection that the operator can actually handle.
+    return bool(targets) and all(kb.lock_shape for kb in targets)
+
+
+def _resolve_bulk_targets(obj):
+    """Return the key blocks a bulk lock / mute action should touch.
+
+    When two or more keys are selected the action is scoped to that
+    selection, matching the way the custom Remove button behaves.
+    With one or zero selected, the action falls back to every key so
+    the old "All" behaviour stays reachable when nothing is selected.
+
+    Basis (index 0) is always excluded: locking or muting it has no
+    useful effect, and the built-in list does not expose those
+    toggles on the Basis row either.
+    """
+    if not obj or not obj.data.shape_keys:
+        return []
+
+    key_blocks = obj.data.shape_keys.key_blocks
+    if len(key_blocks) <= 1:
+        return []
+
+    sel = _get_selection(obj)
+    if len(sel) >= 2:
+        return [kb for kb in key_blocks[1:] if kb.name in sel]
+    return list(key_blocks[1:])
 
 
 def _in_edit_mode(obj):
@@ -690,13 +751,20 @@ def _draw_item_custom(self, context, layout, data, item, icon,
         cur_active = obj.active_shape_key_index
         if prev_active != cur_active:
             _last_active[obj.name] = cur_active
+            # Clicking a row's name only changes active_shape_key_index,
+            # so mirror it into a single-selection. This is what makes
+            # a plain click fall back to the traditional behaviour and
+            # drop any explicit multi-selection the user had built up.
+            #
+            # Our own operators update _last_active themselves before
+            # touching active_shape_key_index, so this path only fires
+            # for clicks on the name column and for scripts that drive
+            # the index directly.
             if cur_active > 0:
                 _select_only(obj, cur_active)
                 _set_anchor(obj, cur_active)
             else:
                 _clear_selection(obj)
-
-    selected = _is_selected(obj, index)
 
     is_drop_target = (
         _drag_state["active"]
@@ -706,24 +774,36 @@ def _draw_item_custom(self, context, layout, data, item, icon,
 
     row = layout.row(align=True)
 
-    # --- Column 1: reorder handle ---
-    # Greyed out in Edit Mode, matching the built-in move buttons.
-    drag_row = row.row(align=True)
-    drag_row.enabled = obj.mode != 'EDIT'
-    drag = drag_row.operator(
-        "xneko.shape_key_drag",
-        text="", icon='GRIP', emboss=False,
-    )
-    drag.source_index = index
+    # Basis (index 0) is structural: it cannot be removed, reordered
+    # or locked, so it does not get a grip handle or a selection
+    # toggle. Drawing empty placeholders keeps the name column
+    # aligned with every other row.
+    if index == 0:
+        placeholder = row.row(align=True)
+        placeholder.enabled = False
+        placeholder.label(text="", icon='BLANK1')
+        placeholder.label(text="", icon='BLANK1')
+    else:
+        selected = _is_selected(obj, index)
+        # --- Column 1: reorder handle ---
+        # Greyed out in Edit Mode, matching the built-in move
+        # buttons.
+        drag_row = row.row(align=True)
+        drag_row.enabled = obj.mode != 'EDIT'
+        drag = drag_row.operator(
+            "xneko.shape_key_drag",
+            text="", icon='GRIP', emboss=False,
+        )
+        drag.source_index = index
 
-    # --- Column 2: selection icon ---
-    sel_icon = ('RESTRICT_SELECT_OFF' if selected
-                else 'RESTRICT_SELECT_ON')
-    sel = row.operator(
-        "xneko.shape_key_select",
-        text="", icon=sel_icon, emboss=False,
-    )
-    sel.clicked_index = index
+        # --- Column 2: selection icon ---
+        sel_icon = ('RESTRICT_SELECT_OFF' if selected
+                    else 'RESTRICT_SELECT_ON')
+        sel = row.operator(
+            "xneko.shape_key_select",
+            text="", icon=sel_icon, emboss=False,
+        )
+        sel.clicked_index = index
 
     # --- Original Blender content: name / value / mute / lock ---
     split = row.split(factor=0.66, align=False)
@@ -774,7 +854,6 @@ def _install_draw_item_patch():
     if _original_draw_item is None:
         _original_draw_item = list_cls.draw_item
     list_cls.draw_item = _draw_item_custom
-    print("[XNeko] draw_item patch installed")
 
 
 def _remove_draw_item_patch():
@@ -803,20 +882,12 @@ def _draw_shape_keys_panel_custom(self, context):
     key = ob.data.shape_keys
 
     if key is None:
-        row = layout.row()
-        col_list = row.column()
-        placeholder = col_list.box()
-        placeholder.scale_y = 5.0
-        placeholder.label(text="")
-        col_btn = row.column(align=True)
-        col_btn.operator("object.shape_key_add", icon='ADD', text="")
-        col_btn.operator("xneko.shape_key_remove_custom",
-                         icon='REMOVE', text="")
-        col_btn.separator()
-        col_btn.menu("MESH_MT_shape_key_context_menu",
-                     icon='DOWNARROW_HLT', text="")
-        if ob.type == 'MESH':
-            layout.prop(ob, "add_rest_position_attribute")
+        # No shape keys on this object: hand the draw over to the
+        # unpatched Blender panel so the empty state stays byte-for-
+        # byte identical to stock. This also keeps the layout in
+        # sync if a future Blender build changes the placeholder.
+        if _original_panel_draw is not None:
+            _original_panel_draw(self, context)
         return
 
     kb = ob.active_shape_key
@@ -838,7 +909,7 @@ def _draw_shape_keys_panel_custom(self, context):
 
     row = layout.row()
     row.template_list(
-        "MESH_UL_shape_keys", "",
+        "SKP_UL_keys", "",
         key, "key_blocks",
         ob, "active_shape_key_index",
         rows=list_rows,
@@ -856,7 +927,7 @@ def _draw_shape_keys_panel_custom(self, context):
     sub = col.column(align=True)
     add_row = sub.row()
     add_row.enabled = structure_enabled
-    add_row.operator("object.shape_key_add", icon='ADD', text="")
+    add_row.operator("xneko.shape_key_add_clean", icon='ADD', text="")
 
     # Grey out Remove while any locked key is in the target set.
     # Blender's built-in remove raises an error on locked keys, so
@@ -920,6 +991,12 @@ def _draw_shape_keys_panel_custom(self, context):
         lock_col.operator("xneko.shape_key_unlock_all",
                           text="", icon='UNLOCKED')
 
+        visibility_col = col.column(align=True)
+        visibility_col.operator("xneko.shape_key_enable_all",
+                                text="", icon='CHECKBOX_HLT')
+        visibility_col.operator("xneko.shape_key_disable_all",
+                                text="", icon='CHECKBOX_DEHLT')
+    
         col.separator()
 
         rename_col = col.column(align=True)
@@ -932,58 +1009,28 @@ def _draw_shape_keys_panel_custom(self, context):
         rename_col.operator("xneko.shape_key_rename_settings",
                             text="", icon='PREFERENCES')
 
-    split = layout.split(factor=0.4)
-    row = split.row()
-    row.enabled = enable_edit
-    row.prop(key, "use_relative", text="Relative")
+    # Filter syntax hint, shown while the background poll is still
+    # watching the cursor. The poll stops once the cursor leaves the
+    # Properties area or the hard time cap expires, which hides this
+    # box on the next redraw.
+    if _hint_poll_active:
+        hint_box = layout.box()
+        hint_col = hint_box.column(align=True)
+        hint_col.scale_y = 0.85
+        hint_col.label(text="Catgirl * Wifu  =  Catgirl and Wifu")
+        hint_col.label(text="Catgirl / Wifu  =  Catgirl or Wifu")
 
-    row = split.row()
-    row.alignment = 'RIGHT'
-
-    sub = row.row(align=True)
-    sub.label()
-    subsub = sub.row(align=True)
-    subsub.active = enable_pin
-    subsub.prop(ob, "show_only_shape_key", text="",
-                icon='SOLO_OFF', toggle=True)
-    sub.prop(ob, "use_shape_key_edit_mode", text="")
-
-    sub = row.row()
-    if key.use_relative:
-        sub.operator("object.shape_key_clear", icon='X', text="")
-    else:
-        sub.operator("object.shape_key_retime",
-                     icon='RECOVER_LAST', text="")
-
-    layout.use_property_split = True
-    if key.use_relative:
-        if ob.active_shape_key_index != 0:
-            row = layout.row()
-            row.active = enable_edit_value
-            row.prop(kb, "value")
-
-            col = layout.column()
-            sub = col.column(align=True)
-            sub.active = enable_edit_value
-            sub.prop(kb, "slider_min", text="Range Min")
-            sub.prop(kb, "slider_max", text="Max")
-
-            col.prop_search(kb, "vertex_group",
-                            ob, "vertex_groups", text="Vertex Group")
-            col.prop_search(kb, "relative_key",
-                            key, "key_blocks", text="Relative To")
-    else:
-        layout.prop(kb, "interpolation")
-        row = layout.column()
-        row.active = enable_edit_value
-        row.prop(key, "eval_time")
-
-    if ob.type == 'MESH':
-        layout.prop(ob, "add_rest_position_attribute")
-
-    # --- Reorder-mode hint, appended below the normal panel ---
-    if _drag_state["active"]:
-        layout.separator()
+    # --- Reorder-mode hint, right below the list ---
+    # Only draw the hint in the panel whose object actually owns the
+    # active drag. Without the obj_name check, a second Properties
+    # area pointed at another object would also show the hint.
+    #
+    # Placed here rather than at the bottom of the panel so the keys
+    # the user is currently dragging stay visible while the hint is
+    # on screen: the value / vertex-group fields below can push the
+    # list far enough up that the last rows would scroll out of view
+    # if the hint lived underneath them.
+    if _drag_state["active"] and _drag_state["obj_name"] == ob.name:
         box = layout.box()
         box.label(text="Reorder Mode", icon='TRIA_RIGHT')
 
@@ -1011,6 +1058,55 @@ def _draw_shape_keys_panel_custom(self, context):
         c.label(text="", icon='MOUSE_RMB')
         row.label(text="Cancel")
 
+    split = layout.split(factor=0.4)
+    row = split.row()
+    row.enabled = enable_edit
+    row.prop(key, "use_relative", text="Relative")
+
+    row = split.row()
+    row.alignment = 'RIGHT'
+
+    sub = row.row(align=True)
+    sub.label()
+    subsub = sub.row(align=True)
+    subsub.active = enable_pin
+    subsub.prop(ob, "show_only_shape_key", text="",
+                icon='SOLO_OFF', toggle=True)
+    sub.prop(ob, "use_shape_key_edit_mode", text="")
+
+    sub = row.row()
+    if key.use_relative:
+        sub.operator("object.shape_key_clear", icon='X', text="")
+    else:
+        sub.operator("object.shape_key_retime",
+                     icon='RECOVER_LAST', text="")
+
+    layout.use_property_split = True
+    if key.use_relative:
+        if kb is not None and ob.active_shape_key_index != 0:
+            row = layout.row()
+            row.active = enable_edit_value
+            row.prop(kb, "value")
+
+            col = layout.column()
+            sub = col.column(align=True)
+            sub.active = enable_edit_value
+            sub.prop(kb, "slider_min", text="Range Min")
+            sub.prop(kb, "slider_max", text="Max")
+
+            col.prop_search(kb, "vertex_group",
+                            ob, "vertex_groups", text="Vertex Group")
+            col.prop_search(kb, "relative_key",
+                            key, "key_blocks", text="Relative To")
+    else:
+        layout.prop(kb, "interpolation")
+        row = layout.column()
+        row.active = enable_edit_value
+        row.prop(key, "eval_time")
+
+    if ob.type == 'MESH':
+        layout.prop(ob, "add_rest_position_attribute")
+
 
 def _install_panel_patch():
     global _original_panel_draw
@@ -1035,6 +1131,206 @@ def _remove_panel_patch():
 
 
 # =====================================================================
+# Shape key list (custom UIList with a name filter)
+# =====================================================================
+
+# Last filter text the UIList saw during a draw. filter_items runs on
+# every redraw, so after the list has been drawn this holds the
+# current search text, letting the panel decide whether to show the
+# syntax hint underneath the list.
+_last_filter_text = ""
+
+# The syntax hint is hidden by a background poll rather than a fixed
+# delay. Blender's native UIList search bar does not expose focus /
+# blur events to Python, so "hide when the user is done typing" has
+# to be approximated. The closest signal is the mouse cursor: once
+# it leaves the Properties area, the user has clearly moved on. A
+# time cap handles the case where the cursor stays parked inside the
+# panel forever.
+_hint_poll_active = False
+_filter_hint_until = 0.0
+
+# Seconds between mouse-position checks while the hint is on screen.
+_HINT_POLL_INTERVAL = 0.2
+
+# Hard cap on how long the hint can stay visible, in seconds.
+_HINT_MAX_DURATION = 8.0
+
+
+def _mouse_in_properties():
+    """True if the cursor is currently inside any Properties area."""
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is None:
+        # Background mode and some scripted contexts have no window
+        # manager. Treat that as "cursor is elsewhere" so the hint
+        # hides rather than throwing inside the timer.
+        return False
+    for window in wm.windows:
+        screen = getattr(window, "screen", None)
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type != 'PROPERTIES':
+                continue
+            for region in area.regions:
+                # region.mouse_x / mouse_y are relative to that
+                # region, so the cursor is inside it when both fall
+                # within its width and height.
+                if (0 <= region.mouse_x < region.width
+                        and 0 <= region.mouse_y < region.height):
+                    return True
+    return False
+
+
+def _redraw_properties():
+    """Tag every Properties area for redraw."""
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is None:
+        return
+    for window in wm.windows:
+        screen = getattr(window, "screen", None)
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type == 'PROPERTIES':
+                area.tag_redraw()
+
+
+def _hint_poll():
+    """Hide the hint once the cursor leaves or the cap expires."""
+    global _hint_poll_active
+    if not _last_filter_text:
+        _hint_poll_active = False
+        return None
+    if (_mouse_in_properties()
+            and time.time() < _filter_hint_until):
+        # Returning a float reschedules the timer.
+        return _HINT_POLL_INTERVAL
+
+    # Cursor is gone (or the cap expired): redraw so the hint
+    # disappears on the next panel draw.
+    _hint_poll_active = False
+    _redraw_properties()
+    return None
+
+
+def _start_hint_poll():
+    """Start the mouse-position poll if it is not already running."""
+    global _hint_poll_active, _filter_hint_until
+    _filter_hint_until = time.time() + _HINT_MAX_DURATION
+    if _hint_poll_active:
+        return
+    _hint_poll_active = True
+    bpy.app.timers.register(
+        _hint_poll,
+        first_interval=_HINT_POLL_INTERVAL,
+    )
+
+
+def _stop_hint_poll():
+    """Cancel the poll and hide the hint immediately."""
+    global _hint_poll_active
+    if not _hint_poll_active:
+        return
+    _hint_poll_active = False
+    try:
+        bpy.app.timers.unregister(_hint_poll)
+    except Exception:
+        pass
+
+
+def _get_filter_matcher(text):
+    """Return a predicate `name -> bool`, or None for "no filter".
+
+    The filter syntax is intentionally minimal:
+
+      * "A * B"  -> the name must contain both A and B
+      * "A / B"  -> the name must contain A or B
+      * "A * B / C" -> A, and (B or C): AND binds tighter than OR
+
+    Both operators need a space on each side, so a shape key whose
+    name happens to contain a bare "*" or "/" is not accidentally
+    split. Every term is a case-insensitive substring match, not a
+    regular expression, which keeps the syntax easy to remember.
+    """
+    if not text or not text.strip():
+        return None
+
+    # Split on the AND operator first so it binds tighter than OR,
+    # matching the usual boolean precedence: "A * B / C" reads as
+    # "(A) AND (B OR C)".
+    and_groups = []
+    for and_part in text.split(" * "):
+        or_group = [
+            needle.strip().lower()
+            for needle in and_part.split(" / ")
+            if needle.strip()
+        ]
+        if or_group:
+            and_groups.append(or_group)
+
+    if not and_groups:
+        return None
+
+    def match(name):
+        low = name.lower()
+        for or_group in and_groups:
+            if not any(needle in low for needle in or_group):
+                return False
+        return True
+
+    return match
+
+
+class SKP_UL_keys(bpy.types.UIList):
+    """Shape key list with the native Blender 4.5 filter bar.
+
+    The class name doubles as the UIList's bl_idname, so it must be
+    globally unique across every addon. The "SKP_" prefix keeps it
+    out of the way of other tools that might also define a shape
+    key list.
+
+    Row layout is delegated to `_draw_item_custom`, the same
+    function the panel patch installs on the built-in UIList, so
+    the two code paths cannot drift apart.
+    """
+
+    def draw_item(self, context, layout, data, item, icon,
+                  active_data, active_propname, index):
+        _draw_item_custom(self, context, layout, data, item, icon,
+                          active_data, active_propname, index)
+
+    def filter_items(self, context, data, propname):
+        global _last_filter_text
+        items = getattr(data, propname)
+        flags = [self.bitflag_filter_item] * len(items)
+
+        # `filter_name` is populated by Blender's native filter bar.
+        # getattr guards against a Blender build without the field.
+        text = getattr(self, "filter_name", "")
+
+        # Only react when the text actually changed. filter_items runs
+        # on every redraw, so restarting the poll on every call would
+        # keep the hint alive forever.
+        if text != _last_filter_text:
+            _last_filter_text = text
+            if text:
+                _start_hint_poll()
+            else:
+                _stop_hint_poll()
+
+        matcher = _get_filter_matcher(text)
+        if matcher is None:
+            return flags, []
+
+        for i, kb in enumerate(items):
+            if not matcher(kb.name):
+                flags[i] = 0
+
+        return flags, []
+
+
+# =====================================================================
 # Select operator
 # =====================================================================
 
@@ -1042,7 +1338,12 @@ class XNEKO_OT_shape_key_select(bpy.types.Operator):
     bl_idname = "xneko.shape_key_select"
     bl_label = "Select Shape Key"
     bl_description = "Click to select. Shift for range, Ctrl for multi-select"
-    bl_options = {'REGISTER', 'UNDO'}
+    # INTERNAL keeps this UI-only operator out of the F3 search. No
+    # UNDO flag: the operator only touches the module-level selection
+    # set and active_shape_key_index, so pushing an undo step here
+    # would make Ctrl+Z step through selections before it reached the
+    # user's last real edit.
+    bl_options = {'INTERNAL'}
 
     clicked_index: IntProperty(default=-1)
 
@@ -1184,8 +1485,107 @@ class XNEKO_OT_shape_key_remove_custom(bpy.types.Operator):
             _last_active[obj.name] = obj.active_shape_key_index
             return {'FINISHED'}
 
-        # Single selection or none: original behaviour.
-        return bpy.ops.object.shape_key_remove(all=False)
+        # Single selection or none: original behaviour, with a guard.
+        # Only locked keys are intercepted up front, because that is
+        # the one case the operator can recognise on its own and give
+        # a clean message for. Everything else, including Basis, is
+        # handed to the native operator so the behaviour matches the
+        # built-in panel exactly. A RuntimeError is caught rather than
+        # allowed to bubble: it would otherwise abort the whole click
+        # and print a traceback, even though the user only needs to
+        # see the reason spelled out.
+        idx = obj.active_shape_key_index
+        if idx < 0 or idx >= len(blocks):
+            return {'CANCELLED'}
+        if blocks[idx].lock_shape:
+            self.report({'WARNING'},
+                        "Locked shape keys cannot be removed")
+            return {'CANCELLED'}
+        try:
+            return bpy.ops.object.shape_key_remove(all=False)
+        except RuntimeError as exc:
+            self.report({'WARNING'}, str(exc))
+            return {'CANCELLED'}
+
+
+# =====================================================================
+# Clean add (zero existing values so the new key starts from Basis)
+# =====================================================================
+
+class XNEKO_OT_shape_key_add_clean(bpy.types.Operator):
+    bl_idname = "xneko.shape_key_add_clean"
+    bl_label = "Add Shape Key"
+    bl_description = (
+        "Add a new shape key directly below the active key. Existing "
+        "shape key values are temporarily zeroed so the new key "
+        "starts from Basis instead of the current mix"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or not obj.data.shape_keys:
+            # No shape keys yet: the native operator creates Basis plus
+            # the first key, and there is nothing to reposition.
+            return bpy.ops.object.shape_key_add()
+
+        if _in_edit_mode(obj):
+            return bpy.ops.object.shape_key_add()
+
+        blocks = obj.data.shape_keys.key_blocks
+
+        # Remember where the new key should land before the add call
+        # runs: shape_key_add appends at the bottom and moves the
+        # active index there, so the original row would be lost.
+        insert_after = obj.active_shape_key_index
+        if insert_after < 0 or insert_after >= len(blocks):
+            insert_after = len(blocks) - 1
+        target_index = insert_after + 1
+
+        saved = [(kb, kb.value) for kb in blocks[1:]]
+
+        # Fast path: when every key is already at zero the clean pass
+        # is a no-op, so call the native operator directly. Skipping
+        # the zero/restore dance avoids momentarily tripping driver
+        # or NLA evaluation, which can flash the mesh for a frame
+        # under some expressions.
+        if not any(value for _, value in saved):
+            result = bpy.ops.object.shape_key_add()
+        else:
+            for kb, _ in saved:
+                kb.value = 0.0
+            try:
+                result = bpy.ops.object.shape_key_add()
+            finally:
+                for kb, value in saved:
+                    kb.value = value
+
+        if 'FINISHED' not in result:
+            return result
+
+        # shape_key_add always appends at the bottom and makes the new
+        # key active. Walk it up until it sits directly below the row
+        # that was active before the add, so the new key lands next to
+        # the one the user was working on instead of at the end of a
+        # long list.
+        #
+        # Each shape_key_move call carries UNDO, so the repositioning
+        # leaves N steps on the undo stack. A named step after the
+        # moves gives the user a single landmark in the Undo History
+        # popup to jump back to without clicking Ctrl+Z N times.
+        moved = False
+        while obj.active_shape_key_index > target_index:
+            bpy.ops.object.shape_key_move(type='UP')
+            moved = True
+        if moved:
+            bpy.ops.ed.undo_push(message="Add Shape Key")
+
+        new_active = obj.active_shape_key_index
+        _last_active[obj.name] = new_active
+        _select_only(obj, new_active)
+        _set_anchor(obj, new_active)
+
+        return result
 
 
 # =====================================================================
@@ -1245,8 +1645,14 @@ class XNEKO_OT_shape_key_new_from_mix(bpy.types.Operator):
             bpy.ops.object.shape_key_add(from_mix=True)
             # shape_key_add always appends at the end and makes the new
             # key active. Walk it up until it lands at target_index.
+            # See XNEKO_OT_shape_key_add_clean for why the named push
+            # is needed after the loop.
+            moved = False
             while obj.active_shape_key_index > target_index:
                 bpy.ops.object.shape_key_move(type='UP')
+                moved = True
+            if moved:
+                bpy.ops.ed.undo_push(message="New Shape From Mix")
         except RuntimeError as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
@@ -1291,27 +1697,62 @@ class XNEKO_OT_shape_key_value_toggle(bpy.types.Operator):
             return {'CANCELLED'}
 
         key_block = blocks[self.index]
-        if key_block.lock_shape:
-            # Mirror the built-in panel: a locked key's value field is
-            # disabled. The radio button cannot be greyed out reliably,
-            # so refuse the edit here instead.
-            return {'CANCELLED'}
 
         key_block.value = 0.0 if key_block.value > 0.0 else 1.0
 
         # Only insert a keyframe when the path is already animated, so
         # a static key does not suddenly pick up an fcurve.
         shape_keys = obj.data.shape_keys
-        if shape_keys.animation_data and shape_keys.animation_data.action:
-            data_path = f'key_blocks["{key_block.name}"].value'
-            action = shape_keys.animation_data.action
-            if any(fc.data_path == data_path for fc in action.fcurves):
-                shape_keys.keyframe_insert(
-                    data_path=data_path,
-                    frame=context.scene.frame_current,
-                )
+        data_path = f'key_blocks["{key_block.name}"].value'
+        if _is_value_animated(shape_keys, data_path):
+            shape_keys.keyframe_insert(
+                data_path=data_path,
+                frame=context.scene.frame_current,
+            )
 
         return {'FINISHED'}
+
+
+# =====================================================================
+# Animation helpers
+# =====================================================================
+
+def _is_value_animated(shape_keys, data_path):
+    """True if the given shape key value path is already animated.
+
+    Handles both animation layouts:
+
+      * legacy actions, where fcurves hang directly off
+        animation_data.action;
+      * slotted actions (Blender 4.4+), where the fcurves live inside
+        a channelbag on a layer strip beneath action.layers.
+
+    When animation_data.action is None there is nothing driving the
+    value, so both layouts can be skipped.
+    """
+    anim_data = shape_keys.animation_data
+    if anim_data is None:
+        return False
+
+    action = anim_data.action
+    if action is not None:
+        # Legacy layout: action.fcurves.
+        for fc in getattr(action, "fcurves", []):
+            if fc.data_path == data_path:
+                return True
+
+        # Slotted layout: layers -> strips -> channelbags -> fcurves.
+        for layer in getattr(action, "layers", []):
+            for strip in getattr(layer, "strips", []):
+                for bag in getattr(strip, "channelbags", []):
+                    for fc in getattr(bag, "fcurves", []):
+                        if fc.data_path == data_path:
+                            return True
+
+    # If the action is None, slotted keyframes cannot exist: the fcurve
+    # always lives on a layer strip inside an action, so there is
+    # nothing else to scan here.
+    return False
 
 
 # =====================================================================
@@ -1320,39 +1761,77 @@ class XNEKO_OT_shape_key_value_toggle(bpy.types.Operator):
 
 class XNEKO_OT_shape_key_lock_all(bpy.types.Operator):
     bl_idname = "xneko.shape_key_lock_all"
-    bl_label = "Lock All Shape Keys"
+    bl_label = "Lock Shape Keys"
     bl_description = (
-        "Lock every shape key except Basis, so they cannot be "
-        "removed or edited by accident"
+        "Lock the selected shape keys, or every shape key when "
+        "fewer than two are selected. Basis is never locked"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        obj = context.object
-        if not obj or not obj.data.shape_keys:
+        targets = _resolve_bulk_targets(context.object)
+        if not targets:
             return {'CANCELLED'}
 
-        for kb in obj.data.shape_keys.key_blocks[1:]:
+        for kb in targets:
             kb.lock_shape = True
         return {'FINISHED'}
 
 
 class XNEKO_OT_shape_key_unlock_all(bpy.types.Operator):
     bl_idname = "xneko.shape_key_unlock_all"
-    bl_label = "Unlock All Shape Keys"
+    bl_label = "Unlock Shape Keys"
     bl_description = (
-        "Unlock every shape key so they can be edited or removed "
-        "again"
+        "Unlock the selected shape keys, or every shape key when "
+        "fewer than two are selected"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        obj = context.object
-        if not obj or not obj.data.shape_keys:
+        targets = _resolve_bulk_targets(context.object)
+        if not targets:
             return {'CANCELLED'}
 
-        for kb in obj.data.shape_keys.key_blocks[1:]:
+        for kb in targets:
             kb.lock_shape = False
+        return {'FINISHED'}
+
+
+class XNEKO_OT_shape_key_enable_all(bpy.types.Operator):
+    bl_idname = "xneko.shape_key_enable_all"
+    bl_label = "Enable Shape Keys"
+    bl_description = (
+        "Unmute the selected shape keys, or every shape key when "
+        "fewer than two are selected. Basis is never affected"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        targets = _resolve_bulk_targets(context.object)
+        if not targets:
+            return {'CANCELLED'}
+
+        for kb in targets:
+            kb.mute = False
+        return {'FINISHED'}
+
+
+class XNEKO_OT_shape_key_disable_all(bpy.types.Operator):
+    bl_idname = "xneko.shape_key_disable_all"
+    bl_label = "Disable Shape Keys"
+    bl_description = (
+        "Mute the selected shape keys, or every shape key when "
+        "fewer than two are selected. Basis is never affected"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        targets = _resolve_bulk_targets(context.object)
+        if not targets:
+            return {'CANCELLED'}
+
+        for kb in targets:
+            kb.mute = True
         return {'FINISHED'}
 
 
@@ -1497,7 +1976,14 @@ class XNEKO_OT_shape_key_drag(bpy.types.Operator):
         "the current selection up or down. Left-click or Enter confirms, "
         "right-click or Esc cancels"
     )
-    bl_options = {'REGISTER'}
+    # UNDO so the finished drag is tagged as one user action. Note that
+    # the individual object.shape_key_move() calls inside
+    # _move_by_delta() also carry UNDO, and Blender exposes no way to
+    # suppress an operator's undo push from Python, so stepping back
+    # one row at a time via Ctrl+Z is still possible. The named step
+    # this flag adds lets the user jump straight to the pre-drag state
+    # from the Undo History popup instead.
+    bl_options = {'REGISTER', 'UNDO'}
 
     source_index: IntProperty(default=-1)
 
@@ -1639,6 +2125,12 @@ class XNEKO_OT_shape_key_drag(bpy.types.Operator):
         if delta == 0:
             return
 
+        # Tag the drag as one named step so it shows up in the Undo
+        # History popup. The move calls below still push their own
+        # steps, but this gives the user a single named landmark to
+        # jump back to without stepping through every row.
+        bpy.ops.ed.undo_push(message="Reorder Shape Keys")
+
         self._move_by_delta(obj, selected_indices, delta, max_index)
 
         new_active = max(0, min(max_index, self._initial_index + delta))
@@ -1659,24 +2151,47 @@ class XNEKO_OT_shape_key_drag(bpy.types.Operator):
 
     @staticmethod
     def _move_by_delta(obj, indices, delta, max_index):
-        if delta > 0:
-            order = sorted(indices, reverse=True)
-        else:
-            order = sorted(indices)
+        """Move the selected keys as one contiguous block.
 
-        for idx in order:
-            obj.active_shape_key_index = idx
-            remaining = abs(delta)
-            if delta > 0:
+        A per-key move scatters the selection: shifting 1, 3, 5 down
+        four rows with independent moves produces
+        2, 4, 6, 7, 1, 8, 3, 9, 5 because each key slides past a
+        different set of neighbours. The intended behaviour is to
+        treat the selection as a unit and shift the whole block, so
+        1, 3, 5 lands at the bottom as 2, 4, 6, 7, 8, 9, 1, 3, 5.
+
+        The block is walked in the direction of travel (bottom-up for
+        a downward move, top-down for an upward move). The first key
+        moves `delta` slots; each subsequent key moves one slot
+        further so it stays directly above the previously moved key.
+        The already-moved neighbour acts as a ceiling / floor, which
+        is what prevents the block from spreading apart.
+        """
+        if not indices:
+            return
+
+        if delta > 0:
+            ceiling = max_index
+            for rank, idx in enumerate(sorted(indices, reverse=True)):
+                obj.active_shape_key_index = idx
+                remaining = delta + rank
                 while (remaining > 0
-                       and obj.active_shape_key_index < max_index):
+                       and obj.active_shape_key_index < ceiling):
                     bpy.ops.object.shape_key_move(type='DOWN')
                     remaining -= 1
-            else:
+                ceiling = obj.active_shape_key_index - 1
+        else:
+            # Basis lives at index 0 and cannot be crossed, so the
+            # block can never reach that slot.
+            floor = 1
+            for rank, idx in enumerate(sorted(indices)):
+                obj.active_shape_key_index = idx
+                remaining = -delta + rank
                 while (remaining > 0
-                       and obj.active_shape_key_index > 1):
+                       and obj.active_shape_key_index > floor):
                     bpy.ops.object.shape_key_move(type='UP')
                     remaining -= 1
+                floor = obj.active_shape_key_index + 1
 
 
 # =====================================================================
@@ -1725,14 +2240,18 @@ def _remove_scene_properties():
 # =====================================================================
 
 classes = (
+    SKP_UL_keys,
     XNEKO_OT_shape_key_select,
     XNEKO_OT_shape_key_remove_custom,
     XNEKO_OT_shape_key_remove_locked,
+    XNEKO_OT_shape_key_add_clean,
     XNEKO_OT_shape_key_new_from_mix,
     XNEKO_OT_shape_key_value_toggle,
     XNEKO_OT_shape_key_toggle_rename_tools,
     XNEKO_OT_shape_key_lock_all,
     XNEKO_OT_shape_key_unlock_all,
+    XNEKO_OT_shape_key_enable_all,  
+    XNEKO_OT_shape_key_disable_all, 
     XNEKO_OT_shape_key_rename_r,
     XNEKO_OT_shape_key_rename_l,
     XNEKO_OT_shape_key_swap_rl,
@@ -1748,13 +2267,28 @@ def on_load():
 
 
 def on_unload():
-    global _batch_operation, _maintenance_counter
+    global _batch_operation, _maintenance_scheduled
+    global _last_filter_text, _filter_hint_until
     _remove_draw_item_patch()
     _remove_panel_patch()
     _remove_scene_properties()
+
+    # Cancel the hint poll so it cannot fire against a torn-down
+    # module after the plugin is disabled.
+    _stop_hint_poll()
+    _last_filter_text = ""
+    _filter_hint_until = 0.0
+
+    # Cancel a pending prune timer so it cannot fire after the module
+    # has been torn down.
+    if _maintenance_scheduled:
+        try:
+            bpy.app.timers.unregister(_run_prune_timer)
+        except Exception:
+            pass
+        _maintenance_scheduled = False
     # Reset shared state so a reload never inherits a stale drag.
     _batch_operation = False
-    _maintenance_counter = 0
     _drag_state["active"] = False
     _drag_state["obj_name"] = ""
     _drag_state["target"] = -1
