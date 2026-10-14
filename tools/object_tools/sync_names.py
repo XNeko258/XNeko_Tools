@@ -21,7 +21,7 @@ class XNEKO_OT_sync_data_names(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return len(context.selected_objects) > 0
+        return bool(context.selected_objects)
 
     def execute(self, context):
         targets = context.selected_objects
@@ -61,7 +61,7 @@ class VIEW3D_PT_xneko_sync_data_names(bpy.types.Panel):
         layout = self.layout
 
         mismatch_count = 0
-        for obj in context.selected_objects:
+        for obj in (context.selected_objects or []):
             data = obj.data
             if data is not None and data.name != obj.name:
                 mismatch_count += 1
