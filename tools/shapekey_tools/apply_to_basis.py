@@ -99,6 +99,9 @@ def swap_with_basis(obj):
     basis = sk.key_blocks[0]
     active = sk.key_blocks[idx]
 
+    if len(basis.data) != len(active.data):
+        return False
+
     basis_co = [pt.co.copy() for pt in basis.data]
     active_co = [pt.co.copy() for pt in active.data]
 
@@ -158,13 +161,20 @@ def _sync_shape_key_list(scene):
         return
 
     sk = obj.data.shape_keys
-    current_names = [kb.name for kb in sk.key_blocks]
-    stored_names = [it.name for it in props.items]
+    items = props.items
 
-    needs_rebuild = (
-        props.source_object != obj.name
-        or current_names != stored_names
-    )
+    # Cheap checks first: object change and length mismatch are O(1).
+    # Only fall through to the element-wise scan when both pass, and
+    # short-circuit on the first difference.
+    if props.source_object != obj.name:
+        needs_rebuild = True
+    elif len(sk.key_blocks) != len(items):
+        needs_rebuild = True
+    else:
+        needs_rebuild = any(
+            kb.name != it.name
+            for kb, it in zip(sk.key_blocks, items)
+        )
 
     if needs_rebuild:
         _sync_guard["busy"] = True

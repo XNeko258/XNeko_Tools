@@ -50,6 +50,22 @@ this tool batch-edits them by a fixed angle around a common pivot.
   Many modifiers with inconsistent names are hard to scan. This
   normalizes them in one click.
 
+## Swap Shape Key with Basis
+
+- **tool_id**: `apply_to_basis`
+- **What it does**:
+  Exchanges the active shape key with the basis: coordinates and
+  names are swapped, and every key value is reset to 0. Mesh
+  vertices are updated to match the new basis so future keys start
+  from the correct shape.
+- **Why it exists**:
+  Blender cannot reorder shape keys, so promoting a key to the basis
+  normally means deleting and recreating them by hand. This swaps
+  them in place in one click. Inspired by the "Apply Selected
+  Shapekey to Basis" feature from
+  [Cats Blender Plugin](https://github.com/teamneoneko/Cats-Blender-Plugin)
+  (no longer maintained).
+
 ## Shape Key Plus
 
 - **tool_id:** `shape_key_plus`
