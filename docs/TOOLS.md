@@ -65,6 +65,19 @@ this tool batch-edits them by a fixed angle around a common pivot.
   Shapekey to Basis" feature from
   [Cats Blender Plugin](https://github.com/teamneoneko/Cats-Blender-Plugin).
 
+## Rig Prep
+
+- **tool_id**: `rig_prep`
+- **What it does**:
+  Extracts a deform-only armature from a source armature. Bones are
+  kept if their name matches a vertex group on a reference mesh;
+  parent chains skip dropped control bones. Rest pose, connect
+  flags, and object transform are preserved.
+- **Why it exists**:
+  Game-ripped armatures ship with many controller bones that do not
+  deform anything. This extracts a clean deform skeleton in one
+  click, without touching the original rig.
+
 ## Shape Key Plus
 
 - **tool_id:** `shape_key_plus`

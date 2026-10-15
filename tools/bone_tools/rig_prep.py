@@ -91,13 +91,14 @@ class XNEKO_RigPrepUI(bpy.types.PropertyGroup):
         default="",
         update=_on_new_name_change,
     )
-    switch_mesh: BoolProperty(
-        name="Switch Mesh Modifiers",
+    use_selected: BoolProperty(
+        name="Include Selected Meshes",
         description=(
-            "Repoint every mesh bound to the source armature so it "
-            "binds to the new one instead"
+            "Also treat every selected mesh as a reference. "
+            "Vertex groups from all references are merged when "
+            "deciding which bones are deform bones"
         ),
-        default=True,
+        default=False,
     )
 
 
@@ -105,25 +106,51 @@ def _ui(context):
     return context.window_manager.xneko_rig_prep_ui
 
 
+def _reference_meshes(ui):
+    """Return every mesh used as a reference.
+
+    The primary picker is always included; when the option is on,
+    every selected mesh is added as well. Order is stable so
+    repeated calls during a single draw pass yield the same list.
+    """
+    meshes = []
+    if ui.ref_mesh is not None:
+        meshes.append(ui.ref_mesh)
+    if ui.use_selected:
+        for obj in (bpy.context.selected_objects or []):
+            if obj.type == 'MESH' and obj not in meshes:
+                meshes.append(obj)
+    return meshes
+
+
 def _is_ready(ui):
-    return ui.src_arm is not None and ui.ref_mesh is not None
+    return ui.src_arm is not None and bool(_reference_meshes(ui))
 
 
 def _is_bound(ui):
-    for mod in ui.ref_mesh.modifiers:
-        if (mod.type == 'ARMATURE'
-                and mod.object == ui.src_arm
-                and mod.use_vertex_groups):
-            return True
+    """Return True if any reference mesh is bound to the source."""
+    for mesh in _reference_meshes(ui):
+        for mod in mesh.modifiers:
+            if (mod.type == 'ARMATURE'
+                    and mod.object == ui.src_arm
+                    and mod.use_vertex_groups):
+                return True
     return False
 
 
 def _deform_bone_names(ui):
-    """Vertex-group names that match a bone on the source armature."""
+    """Vertex-group names that match a bone on the source armature.
+
+    Merges the vertex-group sets of every reference mesh, so a rig
+    whose deform bones are split across several meshes is captured
+    in full.
+    """
     if not _is_ready(ui):
         return []
     bone_names = {b.name for b in ui.src_arm.data.bones}
-    vg_names = {vg.name for vg in ui.ref_mesh.vertex_groups}
+    vg_names = set()
+    for mesh in _reference_meshes(ui):
+        vg_names.update(vg.name for vg in mesh.vertex_groups)
     return sorted(vg_names & bone_names)
 
 
@@ -185,50 +212,23 @@ def _gather_bone_data(arm, keep_names):
     return data
 
 
-def _extract(src_arm, keep_names, new_name):
-    """Create a new armature containing only the named bones.
+def _build_bones(new_obj, new_data, src_arm, bone_data):
+    """Populate new_data with edit bones matching bone_data.
 
-    Source data is read from Bone objects (mode-independent) and
-    written into the new armature's EditBones. Parent chains skip
-    any bone not in keep_names. Object world transform is copied
-    so the new armature occupies the same space as the source.
-    The armature is placed in a dedicated collection at scene
-    root so it does not mix into the active collection.
-
-    If new_name collides with an existing datablock, Blender
-    appends .001, .002, ... on its own.
+    Handles its own edit-mode lifecycle and always exits in
+    OBJECT mode. Does NOT save or restore selection: the caller
+    (_extract) owns that, because the caller is the one that
+    knows what to restore.
     """
-    bone_data = _gather_bone_data(src_arm, keep_names)
-    if not bone_data:
-        raise RuntimeError("No bone data gathered")
-
-    src_matrix = src_arm.matrix_world.copy()
-
-    new_collection = bpy.data.collections.new(new_name)
-    bpy.context.scene.collection.children.link(new_collection)
-
-    new_data = bpy.data.armatures.new(new_name)
-    new_obj = bpy.data.objects.new(new_name, new_data)
-    new_collection.objects.link(new_obj)
-    new_obj.matrix_world = src_matrix
-
     try:
         new_data.display_type = src_arm.data.display_type
         new_data.axes_position = src_arm.data.axes_position
     except Exception:
         pass
 
-    # Make sure we are not in EDIT mode on some other object
-    # before switching active selection.
     if (bpy.context.object is not None
             and bpy.context.object.mode != 'OBJECT'):
         bpy.ops.object.mode_set(mode='OBJECT')
-
-    # Save the selection so the operator can restore it after
-    # extraction. _switch_modifiers relies on the user's selection
-    # to know which meshes to repoint.
-    saved_selection = list(bpy.context.selected_objects)
-    saved_active = bpy.context.view_layer.objects.active
 
     bpy.ops.object.select_all(action='DESELECT')
     new_obj.select_set(True)
@@ -261,16 +261,92 @@ def _extract(src_arm, keep_names, new_name):
     finally:
         bpy.ops.object.mode_set(mode='OBJECT')
 
-    # Restore the user's original selection, then append the new
-    # armature as active so Quick Rig is ready to run.
-    bpy.ops.object.select_all(action='DESELECT')
-    for obj in saved_selection:
+
+def _extract(src_arm, keep_names, new_name):
+    """Create a new armature containing only the named bones.
+
+    Source data is read from Bone objects (mode-independent) and
+    written into the new armature's EditBones. Parent chains skip
+    any bone not in keep_names. Object world transform is copied
+    so the new armature occupies the same space as the source.
+    The armature is placed in a dedicated collection at scene
+    root so it does not mix into the active collection.
+
+    If new_name collides with an existing datablock, Blender
+    appends .001, .002, ... on its own.
+    """
+    bone_data = _gather_bone_data(src_arm, keep_names)
+    if not bone_data:
+        raise RuntimeError("No bone data gathered")
+
+    src_matrix = src_arm.matrix_world.copy()
+
+    # Capture the user's selection BEFORE anything below changes
+    # it. _switch_modifiers in the operator relies on the current
+    # selection, so losing it here would break the flow.
+    saved_selection = list(bpy.context.selected_objects)
+    saved_active = bpy.context.view_layer.objects.active
+
+    new_collection = bpy.data.collections.new(new_name)
+    bpy.context.scene.collection.children.link(new_collection)
+
+    new_data = bpy.data.armatures.new(new_name)
+    new_obj = bpy.data.objects.new(new_name, new_data)
+    new_collection.objects.link(new_obj)
+    new_obj.matrix_world = src_matrix
+
+    success = False
+    try:
+        _build_bones(new_obj, new_data, src_arm, bone_data)
+        success = True
+    except Exception:
+        # Roll back: unlink and remove everything we just added so
+        # the scene is left exactly as it was before this call.
         try:
-            obj.select_set(True)
+            new_collection.objects.unlink(new_obj)
         except Exception:
             pass
-    new_obj.select_set(True)
-    bpy.context.view_layer.objects.active = new_obj
+        try:
+            bpy.context.scene.collection.children.unlink(new_collection)
+        except Exception:
+            pass
+        try:
+            bpy.data.objects.remove(new_obj, do_unlink=True)
+        except Exception:
+            pass
+        try:
+            bpy.data.armatures.remove(new_data)
+        except Exception:
+            pass
+        try:
+            bpy.data.collections.remove(new_collection)
+        except Exception:
+            pass
+        raise
+    finally:
+        # Restore the user's selection regardless of outcome. On
+        # success, append the new armature as active so the
+        # operator can chain into _switch_modifiers immediately.
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+        except Exception:
+            pass
+        for obj in saved_selection:
+            try:
+                obj.select_set(True)
+            except Exception:
+                pass
+        if success:
+            try:
+                new_obj.select_set(True)
+                bpy.context.view_layer.objects.active = new_obj
+            except Exception:
+                pass
+        else:
+            try:
+                bpy.context.view_layer.objects.active = saved_active
+            except Exception:
+                pass
 
     return new_obj
 
@@ -354,7 +430,10 @@ class XNEKO_OT_rig_prep_extract(bpy.types.Operator):
             f"({len(keep)} bones, {switched} switched)",
         )
 
-        bpy.ops.object.select_all(action='DESELECT')
+        # Append the new armature to the current selection instead
+        # of collapsing the selection to just the new object. Users
+        # often want to keep the meshes selected so they can chain
+        # another operation right away.
         new_arm.select_set(True)
         context.view_layer.objects.active = new_arm
 
@@ -378,6 +457,16 @@ class VIEW3D_PT_xneko_rig_prep(bpy.types.Panel):
         box = layout.box()
         box.prop(ui, "src_arm", text="Source", icon='ARMATURE_DATA')
         box.prop(ui, "ref_mesh", text="Reference", icon='MESH_DATA')
+        box.prop(ui, "use_selected")
+
+        if ui.use_selected:
+            refs = _reference_meshes(ui)
+            hint = box.row()
+            hint.enabled = False
+            hint.label(
+                text=f"Using {len(refs)} reference mesh(es)",
+                icon='INFO',
+            )
 
         # ---- Gate: both picked ----
         if not _is_ready(ui):
