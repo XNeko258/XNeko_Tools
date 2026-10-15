@@ -28,6 +28,17 @@ this tool batch-edits them by a fixed angle around a common pivot.
   Merged and imported meshes pile up dead vertex groups. This clears
   them in one click, without breaking deform setups.
 
+## Vertex Group to Bones
+
+- **tool_id**: `vertex_group_to_bones`
+- **What it does**:
+  Creates one bone per selected vertex group, at the weighted
+  centroid of its high-weight vertices. Groups matching an
+  existing bone name are hidden.
+- **Why it exists**:
+  Imported meshes often carry vertex groups but no matching
+  armature. This rebuilds the skeleton directly from the weights.
+
 ## Sync Data Names
 
 - **tool_id**: `sync_names`
