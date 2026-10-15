@@ -25,8 +25,33 @@ class XNEKO_VGBGroupItem(bpy.types.PropertyGroup):
     selected: bpy.props.BoolProperty(default=False)
 
 
+_sync_guard = {"busy": False}
+
+
 def _armature_poll(self, obj):
     return obj is not None and obj.type == 'ARMATURE'
+
+
+def _on_armature_change(self, context):
+    """Rebuild the cached list when the target armature changes.
+
+    The list is filtered by the target armature's existing bone
+    names, so switching it changes what the user sees. Attempted
+    immediately; if the context forbids writing, the next
+    depsgraph tick will rebuild instead.
+    """
+    if _sync_guard["busy"]:
+        return
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH':
+        return
+    _sync_guard["busy"] = True
+    try:
+        _sync_vertex_groups(obj, self)
+    except Exception as e:
+        print(f"[XNeko] vgb armature-change sync error: {e}")
+    finally:
+        _sync_guard["busy"] = False
 
 
 class XNEKO_VGBProperties(bpy.types.PropertyGroup):
@@ -38,6 +63,7 @@ class XNEKO_VGBProperties(bpy.types.PropertyGroup):
         ),
         type=bpy.types.Object,
         poll=_armature_poll,
+        update=_on_armature_change,
     )
     threshold: bpy.props.FloatProperty(
         name="Head Threshold",
@@ -72,20 +98,47 @@ class XNEKO_VGBProperties(bpy.types.PropertyGroup):
 # Sync vertex group list
 # ============================================================
 def _sync_vertex_groups(obj, props):
-    current_names = [vg.name for vg in obj.vertex_groups]
+    """Refresh the cached vertex-group list for the active mesh.
 
-    # Target object changed -> reset
-    if props.target_object != obj.name:
-        props.groups.clear()
-        props.target_object = obj.name
+    The list is filtered by the target armature: any vertex group
+    whose name already exists as a bone is excluded, since it
+    cannot be generated without a name collision. Cache key
+    includes the armature name and bone count, so switching
+    armatures or adding/removing bones forces a rebuild.
+    """
+    arm = props.armature
+    if arm is not None:
+        arm_name = arm.name
+        bone_names = {b.name for b in arm.data.bones}
+        bone_count = len(bone_names)
+    else:
+        arm_name = ""
+        bone_names = set()
+        bone_count = 0
 
-    # Same name list -> nothing to do
-    if [item.name for item in props.groups] == current_names:
-        return
+    cache_key = f"{obj.name}::{arm_name}::{bone_count}"
 
-    # Preserve existing selection state, then rebuild
-    old_state = {item.name: item.selected for item in props.groups}
+    current_names = [
+        vg.name for vg in obj.vertex_groups
+        if vg.name not in bone_names
+    ]
+
+    # Fast path: cache key matches and the filtered list is
+    # identical. Length check is O(1); the element-wise scan only
+    # runs when the length matches, and short-circuits on the
+    # first difference.
+    if props.target_object == cache_key:
+        items = props.groups
+        if len(items) == len(current_names):
+            if all(it.name == nm for it, nm in zip(items, current_names)):
+                return
+
+    # Slow path: rebuild the list. Preserve selection by name so
+    # a rename or add/remove keeps whatever the user already
+    # checked.
+    old_state = {it.name: it.selected for it in props.groups}
     props.groups.clear()
+    props.target_object = cache_key
     for name in current_names:
         item = props.groups.add()
         item.name = name
@@ -102,13 +155,10 @@ def _sync_vertex_groups(obj, props):
 # ============================================================
 # Depsgraph handler
 # ------------------------------------------------------------
-# Guard prevents the handler from re-entering itself while it
-# mutates the props collection (which would trigger another
-# depsgraph update in some Blender builds).
+# _sync_guard is declared near the top of the file so
+# _on_armature_change can use it before this section. The same
+# guard protects both entry points against re-entrant updates.
 # ============================================================
-_sync_guard = {"busy": False}
-
-
 def _xneko_vgb_depsgraph_handler(scene, *args):
     if _sync_guard["busy"]:
         return
@@ -119,11 +169,16 @@ def _xneko_vgb_depsgraph_handler(scene, *args):
 
     obj = bpy.context.active_object
 
-    # No mesh selected -> clear list
+    # No mesh selected -> clear list. Guard the write so the
+    # collection clear cannot bounce back into this handler.
     if obj is None or obj.type != 'MESH':
         if props.target_object or len(props.groups) > 0:
-            props.target_object = ""
-            props.groups.clear()
+            _sync_guard["busy"] = True
+            try:
+                props.target_object = ""
+                props.groups.clear()
+            finally:
+                _sync_guard["busy"] = False
         return
 
     _sync_guard["busy"] = True
@@ -169,7 +224,9 @@ class XNEKO_OT_vgb_generate(bpy.types.Operator):
         threshold = props.threshold
         bone_length = props.bone_length
 
-        selected_names = [item.name for item in props.groups if item.selected]
+        selected_names = {
+            item.name for item in props.groups if item.selected
+        }
         if not selected_names:
             self.report({'WARNING'}, "No vertex groups selected")
             return {'CANCELLED'}
@@ -214,20 +271,41 @@ class XNEKO_OT_vgb_generate(bpy.types.Operator):
             inv_arm = arm_obj.matrix_world.inverted()
             inv_arm_3x3 = inv_arm.to_3x3()
 
-            group_members = {vg.index: [] for vg in obj.vertex_groups}
+            # Only groups we are actually going to generate bones
+            # for need their members collected. On a mesh with 128
+            # vertex groups where the user selected a handful,
+            # this skips most of the per-vertex work, including
+            # the matrix_world multiply for vertices that do not
+            # belong to any selected group.
+            selected_indices = {
+                vg.index for vg in obj.vertex_groups
+                if vg.name in selected_names
+            }
+            group_members = {idx: [] for idx in selected_indices}
+
             for v in obj.data.vertices:
+                relevant = [
+                    g for g in v.groups
+                    if g.weight > 0.0 and g.group in selected_indices
+                ]
+                if not relevant:
+                    continue
                 world_pos = obj.matrix_world @ v.co
-                for g in v.groups:
-                    if g.weight > 0.0 and g.group in group_members:
-                        group_members[g.group].append(
-                            (g.weight, world_pos.copy())
-                        )
+                for g in relevant:
+                    group_members[g.group].append(
+                        (g.weight, world_pos.copy())
+                    )
+
+            # Snapshot existing bones once. edit_bones updates as
+            # we add to it, so the membership test below must
+            # check the pre-existing set, not the live collection.
+            existing_bones = {b.name for b in arm_data.edit_bones}
 
             for vg in obj.vertex_groups:
                 if vg.name not in selected_names:
                     continue
 
-                if vg.name in arm_data.edit_bones:
+                if vg.name in existing_bones:
                     skipped += 1
                     continue
 
@@ -296,23 +374,16 @@ class XNEKO_OT_vgb_select(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.xneko_vgb_props
-        for item in props.groups:
-            if self.action == 'SELECT':
+        action = self.action
+        if action == 'SELECT':
+            for item in props.groups:
                 item.selected = True
-            elif self.action == 'DESELECT':
+        elif action == 'DESELECT':
+            for item in props.groups:
                 item.selected = False
-            else:
+        else:
+            for item in props.groups:
                 item.selected = not item.selected
-        return {'FINISHED'}
-
-
-class XNEKO_OT_vgb_clear_armature(bpy.types.Operator):
-    bl_idname = "xneko.vgb_clear_armature"
-    bl_label = "Clear Target Armature"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        context.scene.xneko_vgb_props.armature = None
         return {'FINISHED'}
 
 
@@ -371,11 +442,7 @@ class VIEW3D_PT_xneko_vgb(bpy.types.Panel):
         box = layout.box()
         box.label(text="Target Armature", icon='ARMATURE_DATA')
 
-        row = box.row(align=True)
-        row.prop(props, "armature", text="")
-        sub = row.row(align=True)
-        sub.enabled = props.armature is not None
-        sub.operator("xneko.vgb_clear_armature", text="", icon='X')
+        box.prop(props, "armature", text="")
 
         if props.armature is None:
             box.label(text="Empty -> Create new armature", icon='INFO')
@@ -401,11 +468,27 @@ class VIEW3D_PT_xneko_vgb(bpy.types.Panel):
         box.label(text="Vertex Groups (check to generate)",
                   icon='GROUP_VERTEX')
 
-        if len(props.groups) == 0:
-            box.label(text="(No vertex groups)", icon='INFO')
+        total_vgs = len(obj.vertex_groups)
+        shown = len(props.groups)
+
+        if shown == 0:
+            if props.armature is not None and total_vgs > 0:
+                box.label(
+                    text="All vertex groups already have matching bones",
+                    icon='INFO',
+                )
+            else:
+                box.label(text="(No vertex groups)", icon='INFO')
         else:
             checked = sum(1 for it in props.groups if it.selected)
-            box.label(text=f"{checked} / {len(props.groups)} selected")
+            box.label(text=f"{checked} / {shown} selected")
+            if shown < total_vgs:
+                hint = box.row()
+                hint.enabled = False
+                hint.label(
+                    text=f"{total_vgs - shown} hidden (bones already exist)",
+                    icon='INFO',
+                )
 
             box.template_list(
                 "XNEKO_UL_vgb_groups", "xneko_vgb_groups",
@@ -439,7 +522,6 @@ classes = (
     XNEKO_UL_vgb_groups,
     XNEKO_OT_vgb_generate,
     XNEKO_OT_vgb_select,
-    XNEKO_OT_vgb_clear_armature,
     VIEW3D_PT_xneko_vgb,
 )
 

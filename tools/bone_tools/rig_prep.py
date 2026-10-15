@@ -1,6 +1,9 @@
 import bpy
 from mathutils import Vector
-from bpy.props import PointerProperty, StringProperty, BoolProperty
+from bpy.props import (
+    PointerProperty, StringProperty, BoolProperty,
+    CollectionProperty, IntProperty,
+)
 
 
 # ------------------------------------------------------------
@@ -68,6 +71,14 @@ def _on_new_name_change(self, context):
         _last_auto_name = auto
 
 
+class XNEKO_RigPrepRef(bpy.types.PropertyGroup):
+    obj: PointerProperty(
+        name="Object",
+        type=bpy.types.Object,
+        poll=_poll_mesh,
+    )
+
+
 class XNEKO_RigPrepUI(bpy.types.PropertyGroup):
     src_arm: PointerProperty(
         name="Source",
@@ -76,12 +87,8 @@ class XNEKO_RigPrepUI(bpy.types.PropertyGroup):
         poll=_poll_armature,
         update=_on_src_arm_change,
     )
-    ref_mesh: PointerProperty(
-        name="Reference",
-        description="Mesh whose vertex groups identify deform bones",
-        type=bpy.types.Object,
-        poll=_poll_mesh,
-    )
+    references: CollectionProperty(type=XNEKO_RigPrepRef)
+    active_ref_index: bpy.props.IntProperty(default=0)
     new_name: StringProperty(
         name="Name",
         description=(
@@ -91,14 +98,13 @@ class XNEKO_RigPrepUI(bpy.types.PropertyGroup):
         default="",
         update=_on_new_name_change,
     )
-    use_selected: BoolProperty(
-        name="Include Selected Meshes",
+    switch_mesh: BoolProperty(
+        name="Switch Mesh Modifiers",
         description=(
-            "Also treat every selected mesh as a reference. "
-            "Vertex groups from all references are merged when "
-            "deciding which bones are deform bones"
+            "Repoint every selected mesh bound to the source "
+            "armature so it binds to the new one instead"
         ),
-        default=False,
+        default=True,
     )
 
 
@@ -107,19 +113,19 @@ def _ui(context):
 
 
 def _reference_meshes(ui):
-    """Return every mesh used as a reference.
+    """Return every mesh referenced by the list, in list order.
 
-    The primary picker is always included; when the option is on,
-    every selected mesh is added as well. Order is stable so
-    repeated calls during a single draw pass yield the same list.
+    Dead entries (object was deleted) and duplicates are skipped
+    so downstream helpers never have to guard against them.
     """
     meshes = []
-    if ui.ref_mesh is not None:
-        meshes.append(ui.ref_mesh)
-    if ui.use_selected:
-        for obj in (bpy.context.selected_objects or []):
-            if obj.type == 'MESH' and obj not in meshes:
-                meshes.append(obj)
+    seen = set()
+    for item in ui.references:
+        obj = item.obj
+        if obj is None or obj.name in seen:
+            continue
+        meshes.append(obj)
+        seen.add(obj.name)
     return meshes
 
 
@@ -152,6 +158,19 @@ def _deform_bone_names(ui):
     for mesh in _reference_meshes(ui):
         vg_names.update(vg.name for vg in mesh.vertex_groups)
     return sorted(vg_names & bone_names)
+
+
+# ============================================================
+# UIList
+# ============================================================
+class XNEKO_UL_rig_prep_refs(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon,
+                  active_data, active_propname, index):
+        obj = item.obj
+        if obj is None:
+            layout.label(text="(missing)", icon='ERROR')
+            return
+        layout.label(text=obj.name, icon='MESH_DATA')
 
 
 # ============================================================
@@ -374,6 +393,57 @@ def _switch_modifiers(src_arm, new_arm):
 # ============================================================
 # Operator
 # ============================================================
+class XNEKO_OT_rig_prep_add_selected(bpy.types.Operator):
+    bl_idname = "xneko.rig_prep_add_selected"
+    bl_label = "Add Selected Meshes"
+    bl_description = "Add every selected mesh to the reference list"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        ui = _ui(context)
+        existing = {it.obj for it in ui.references if it.obj is not None}
+        added = 0
+        for obj in (context.selected_objects or []):
+            if obj.type != 'MESH' or obj in existing:
+                continue
+            item = ui.references.add()
+            item.obj = obj
+            added += 1
+        if added == 0:
+            self.report({'INFO'}, "No new mesh to add")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Added {added} reference(s)")
+        return {'FINISHED'}
+
+
+class XNEKO_OT_rig_prep_remove_ref(bpy.types.Operator):
+    bl_idname = "xneko.rig_prep_remove_ref"
+    bl_label = "Remove Reference"
+    bl_options = {'INTERNAL'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        ui = _ui(context)
+        if 0 <= self.index < len(ui.references):
+            ui.references.remove(self.index)
+            if ui.active_ref_index >= len(ui.references):
+                ui.active_ref_index = max(0, len(ui.references) - 1)
+        return {'FINISHED'}
+
+
+class XNEKO_OT_rig_prep_clear_refs(bpy.types.Operator):
+    bl_idname = "xneko.rig_prep_clear_refs"
+    bl_label = "Clear References"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        ui = _ui(context)
+        ui.references.clear()
+        ui.active_ref_index = 0
+        return {'FINISHED'}
+
+
 class XNEKO_OT_rig_prep_extract(bpy.types.Operator):
     bl_idname = "xneko.rig_prep_extract"
     bl_label = "Extract Deform Skeleton"
@@ -456,17 +526,33 @@ class VIEW3D_PT_xneko_rig_prep(bpy.types.Panel):
         # ---- Pickers ----
         box = layout.box()
         box.prop(ui, "src_arm", text="Source", icon='ARMATURE_DATA')
-        box.prop(ui, "ref_mesh", text="Reference", icon='MESH_DATA')
-        box.prop(ui, "use_selected")
 
-        if ui.use_selected:
-            refs = _reference_meshes(ui)
-            hint = box.row()
-            hint.enabled = False
-            hint.label(
-                text=f"Using {len(refs)} reference mesh(es)",
-                icon='INFO',
-            )
+        box.label(text="References:")
+
+        row = box.row()
+
+        col = row.column()
+        col.template_list(
+            "XNEKO_UL_rig_prep_refs", "",
+            ui, "references",
+            ui, "active_ref_index",
+            rows=4,
+        )
+
+        col = row.column(align=True)
+        col.operator(
+            "xneko.rig_prep_add_selected",
+            text="", icon='ADD',
+        )
+        col.operator(
+            "xneko.rig_prep_remove_ref",
+            text="", icon='REMOVE',
+        ).index = ui.active_ref_index
+        col.separator()
+        col.operator(
+            "xneko.rig_prep_clear_refs",
+            text="", icon='TRASH',
+        )
 
         # ---- Gate: both picked ----
         if not _is_ready(ui):
@@ -531,7 +617,12 @@ class VIEW3D_PT_xneko_rig_prep(bpy.types.Panel):
 # Registration
 # ============================================================
 classes = (
+    XNEKO_RigPrepRef,
     XNEKO_RigPrepUI,
+    XNEKO_UL_rig_prep_refs,
+    XNEKO_OT_rig_prep_add_selected,
+    XNEKO_OT_rig_prep_remove_ref,
+    XNEKO_OT_rig_prep_clear_refs,
     XNEKO_OT_rig_prep_extract,
     VIEW3D_PT_xneko_rig_prep,
 )
