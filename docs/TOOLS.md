@@ -106,6 +106,15 @@ this tool batch-edits them by a fixed angle around a common pivot.
 - **Why it exists:** Vertex-group management hits the same bottleneck
   once a rig has more than a handful of groups.
 
+## Driver Cleaner
+
+- **tool_id:** `driver_cleaner`
+- **What it does:** Lists invalid and duplicate drivers on selected objects only — object itself, 
+  its data, shape keys / key blocks, bones, pose bones, and materials. 
+  Each problem item can be checked individually, or cleaned by category with **Clean All Invalid** / **Clean All Dup**. 
+  Duplicate detection uses `(data_path, array_index, expression)` as the signature and keeps the first driver.
+- **Why it exists:** Edited armatures often carry dead and duplicated drivers that cause heavy viewport lag. 
+  This tool finds and clears them on the selection in one click, without touching unrelated data.
 ---
 
 <!-- New tool template:
