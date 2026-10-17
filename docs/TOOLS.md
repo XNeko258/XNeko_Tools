@@ -115,6 +115,20 @@ this tool batch-edits them by a fixed angle around a common pivot.
   Duplicate detection uses `(data_path, array_index, expression)` as the signature and keeps the first driver.
 - **Why it exists:** Edited armatures often carry dead and duplicated drivers that cause heavy viewport lag. 
   This tool finds and clears them on the selection in one click, without touching unrelated data.
+
+## Quick Eye Bone
+
+- **tool_id:** `quick_eye_bone`
+
+- **What it does:**
+One-click modal placement to instantly generate a complete eye rig.
+- - **Symmetry & Snapping:** Live X/Y mirroring with native Blender snapping (Vertex/Edge/Face) and `Ctrl` override.
+- - **Full Hierarchy:** Creates deform bones, side controls, a master control, and an optional pupil bone.
+- - **Auto-Collections:** Automatically groups bones into nested collections (`Quick Eye Rig` > `Eye` / `Eye Control`).
+- - **Customizable:** Adjust names, handle sizes, marker colors, and snap sensitivity in preferences.
+- **Why it exists:**
+To eliminate tedious manual eye rigging. Inspired by the **Auto-Rig Pro (ARP) Smart** marker system, it turns a multi-step setup into a single, fluid click.
+
 ---
 
 <!-- New tool template:
