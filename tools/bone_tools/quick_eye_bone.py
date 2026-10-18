@@ -6,7 +6,7 @@ from mathutils.bvhtree import BVHTree
 from bpy_extras import view3d_utils
 import gpu
 from gpu_extras.batch import batch_for_shader
-from bpy.props import FloatVectorProperty, FloatProperty, StringProperty, EnumProperty, BoolProperty
+from bpy.props import FloatVectorProperty, FloatProperty, StringProperty, EnumProperty, BoolProperty, PointerProperty
 
 # ==========================================
 # XNeko_Tools Framework Metadata
@@ -124,7 +124,7 @@ def _get_prefs():
     except Exception:
         return None
 
-# Helper function: align bone Z axis (referenced from ARP)
+# Helper function: align bone Z axis
 def align_bone_z_axis(edit_bone, target_z):
     y_axis = edit_bone.y_axis
     x_axis = y_axis.cross(target_z).normalized()
@@ -149,6 +149,16 @@ class XNEKO_OT_eye_rig_modal(bpy.types.Operator):
                 or context.mode != 'OBJECT'):
             self.report({'WARNING'}, "Please select a visible mesh in the viewport in Object Mode!")
             return {'CANCELLED'}
+
+        target_arm = getattr(context.scene, "quick_eye_target_arm", None)
+        if target_arm:
+            if target_arm.name not in bpy.data.objects:
+                self.report({'WARNING'}, "Target armature no longer exists.")
+                return {'CANCELLED'}
+            target_bone = getattr(context.scene, "quick_eye_target_bone", "")
+            if not target_bone or target_bone not in target_arm.data.bones:
+                self.report({'WARNING'}, "Please select a valid parent bone from the target armature.")
+                return {'CANCELLED'}
 
         self.obj = obj
         self.region = context.region
@@ -432,28 +442,42 @@ class XNEKO_OT_eye_rig_modal(bpy.types.Operator):
         batch_center.draw(shader)
 
     def generate_bones(self, context):
-        col_name = "Eye_Rig_Collection"
-        eye_col = bpy.data.collections.get(col_name)
-        if not eye_col:
-            eye_col = bpy.data.collections.new(col_name)
-            context.scene.collection.children.link(eye_col)
-
-        arm_data = bpy.data.armatures.new("Eye_Rig_Data")
-        arm_obj = bpy.data.objects.new("Eye_Rig", arm_data)
-        eye_col.objects.link(arm_obj)
+        target_arm = getattr(context.scene, "quick_eye_target_arm", None)
+        target_bone_name = getattr(context.scene, "quick_eye_target_bone", "")
         
-        show_front = getattr(context.scene, "quick_eye_show_in_front", True)
-        arm_obj.show_in_front = show_front
+        if target_arm and target_arm.name in bpy.data.objects:
+            arm_obj = target_arm
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.select_all(action='DESELECT')
+            bpy.context.view_layer.objects.active = arm_obj
+            arm_obj.select_set(True)
+            bpy.ops.object.mode_set(mode='EDIT')
+        else:
+            col_name = "Eye_Rig_Collection"
+            eye_col = bpy.data.collections.get(col_name)
+            if not eye_col:
+                eye_col = bpy.data.collections.new(col_name)
+                context.scene.collection.children.link(eye_col)
 
-        if context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        bpy.ops.object.select_all(action='DESELECT')
-        bpy.context.view_layer.objects.active = arm_obj
-        arm_obj.select_set(True)
-        bpy.ops.object.mode_set(mode='EDIT')
+            arm_data = bpy.data.armatures.new("Eye_Rig_Data")
+            arm_obj = bpy.data.objects.new("Eye_Rig", arm_data)
+            eye_col.objects.link(arm_obj)
+            
+            show_front = getattr(context.scene, "quick_eye_show_in_front", True)
+            arm_obj.show_in_front = show_front
+
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.select_all(action='DESELECT')
+            bpy.context.view_layer.objects.active = arm_obj
+            arm_obj.select_set(True)
+            bpy.ops.object.mode_set(mode='EDIT')
 
         try:
             ebones = arm_obj.data.edit_bones
+            parent_bone = ebones.get(target_bone_name) if target_bone_name else None
+            
             left_pos = self.anchors[0]
             right_pos = self.anchors[1]
             
@@ -462,7 +486,6 @@ class XNEKO_OT_eye_rig_modal(bpy.types.Operator):
             gen_deform = getattr(context.scene, "quick_eye_gen_deform", True)
             gen_ctrl_pupil = getattr(context.scene, "quick_eye_gen_pupil", True)
             
-            # Fallbacks for empty names
             actual_bone_l = getattr(prefs, "eye_bone_name_l", "").strip() or "Eye.L"
             actual_bone_r = getattr(prefs, "eye_bone_name_r", "").strip() or "Eye.R"
             actual_master_ctrl = getattr(prefs, "bone_name_ctrl_master", "").strip() or "Eye.Control.C"
@@ -498,13 +521,13 @@ class XNEKO_OT_eye_rig_modal(bpy.types.Operator):
                 bone_left.head = left_pos + offset
                 bone_left.tail = left_pos
                 align_bone_z_axis(bone_left, Vector((0, 0, 1)))
-                bone_left.parent = None
+                bone_left.parent = parent_bone
 
                 bone_right = ebones.new(actual_bone_r)
                 bone_right.head = right_pos + offset
                 bone_right.tail = right_pos
                 align_bone_z_axis(bone_right, Vector((0, 0, 1)))
-                bone_right.parent = None
+                bone_right.parent = parent_bone
 
             # 2. Master Control Bone
             master_ctrl = ebones.new(actual_master_ctrl)
@@ -513,7 +536,7 @@ class XNEKO_OT_eye_rig_modal(bpy.types.Operator):
             master_ctrl.head = master_head
             master_ctrl.tail = master_head + center_dir * 0.02
             align_bone_z_axis(master_ctrl, Vector((0, 0, 1)))
-            master_ctrl.parent = None
+            master_ctrl.parent = parent_bone
 
             # 3. Pupil Control Bone
             if gen_ctrl_pupil:
@@ -561,12 +584,25 @@ class XNEKO_OT_eye_rig_modal(bpy.types.Operator):
         if hasattr(arm_obj.data, "collections"):
             default_coll = arm_obj.data.collections.get("Collection")
             
-            master_coll = arm_obj.data.collections.new("Quick Eye Rig")
+            master_coll = arm_obj.data.collections.get("Quick Eye Rig")
+            if not master_coll:
+                master_coll = arm_obj.data.collections.new("Quick Eye Rig")
             
-            eye_coll = arm_obj.data.collections.new("Eye")
+            # Move to Top
+            all_colls = [c.name for c in arm_obj.data.collections]
+            if master_coll.name in all_colls:
+                idx = all_colls.index(master_coll.name)
+                if idx > 0:
+                    arm_obj.data.collections.move(idx, 0)
+            
+            eye_coll = arm_obj.data.collections.get("Eye")
+            if not eye_coll:
+                eye_coll = arm_obj.data.collections.new("Eye")
             eye_coll.parent = master_coll
             
-            ctrl_coll = arm_obj.data.collections.new("Eye Control")
+            ctrl_coll = arm_obj.data.collections.get("Eye Control")
+            if not ctrl_coll:
+                ctrl_coll = arm_obj.data.collections.new("Eye Control")
             ctrl_coll.parent = master_coll
             
             for b_name in [actual_bone_l, actual_bone_r]:
@@ -583,7 +619,7 @@ class XNEKO_OT_eye_rig_modal(bpy.types.Operator):
                     if default_coll:
                         default_coll.unassign(bone)
 
-        self.report({'INFO'}, f"Generated new armature: {arm_obj.name}")
+        self.report({'INFO'}, f"Generated eye bones in {arm_obj.name}")
 
     def cleanup(self, context):
         context.window.cursor_modal_restore()
@@ -638,6 +674,30 @@ class XNEKO_PT_eye_rig_panel(bpy.types.Panel):
             
             layout.separator()
 
+            # Bind to Existing Rig Box
+            box = layout.box()
+            box.label(text="Bind to Existing Rig (Optional)", icon='ARMATURE_DATA')
+            
+            row = box.row(align=True)
+            row.prop(scene, "quick_eye_target_arm", text="")
+            
+            target_arm = scene.quick_eye_target_arm
+            is_target_valid = True
+            
+            if target_arm and target_arm.name in bpy.data.objects:
+                # ✅ Use prop_search to search bones, includes native magnifier and viewport picker
+                split = box.split(factor=0.15)
+                split.label(text="Bone:")
+                split.prop_search(scene, "quick_eye_target_bone", target_arm.data, "bones", text="")
+                
+                target_bone = scene.quick_eye_target_bone
+                if not target_bone or target_bone not in target_arm.data.bones:
+                    is_target_valid = False
+            elif target_arm:
+                is_target_valid = False
+
+            layout.separator()
+
             # Generation Options Box
             box = layout.box()
             row = box.row()
@@ -661,9 +721,10 @@ class XNEKO_PT_eye_rig_panel(bpy.types.Panel):
             layout.separator()
             
             # Generate Button
-            col = layout.column()
-            col.scale_y = 1.5
-            col.operator("xneko.eye_rig_modal", text="Quick Locate & Generate", icon='TRACKER')
+            row = layout.row()
+            row.scale_y = 1.5
+            row.enabled = is_target_valid
+            row.operator("xneko.eye_rig_modal", text="Quick Locate & Generate", icon='TRACKER')
             
         else:
             col = layout.column(align=True)
@@ -727,3 +788,20 @@ if not hasattr(bpy.types.Scene, "quick_eye_deform_constraint"):
         default=False,
         description="Automatically make deform bones track the control bones"
     )
+
+if not hasattr(bpy.types.Scene, "quick_eye_target_arm"):
+    bpy.types.Scene.quick_eye_target_arm = PointerProperty(
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'ARMATURE',
+        name="Target Armature",
+        description="Bind the generated bones to this armature"
+    )
+
+# ✅ Force clear old property to prevent hot-reload errors
+if hasattr(bpy.types.Scene, "quick_eye_target_bone"):
+    del bpy.types.Scene.quick_eye_target_bone
+
+bpy.types.Scene.quick_eye_target_bone = StringProperty(
+    name="Parent Bone",
+    description="The bone to parent the new eye bones to"
+)
