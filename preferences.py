@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import hashlib
 import importlib
 import bpy
 from bpy.props import (
@@ -852,7 +851,11 @@ class XNEKO_OT_delete_preset(bpy.types.Operator):
     def execute(self, context):
         if not self.preset_name:
             return {'CANCELLED'}
-        preset_store.delete_preset(self.preset_name)
+        try:
+            preset_store.delete_preset(self.preset_name)
+        except OSError as e:
+            self.report({'ERROR'}, f"Cannot delete preset: {e}")
+            return {'CANCELLED'}
         _invalidate_preset_cache()
         self.report({'INFO'}, f"Deleted '{self.preset_name}'")
         return {'FINISHED'}
@@ -989,6 +992,15 @@ class XNEKO_OT_clear_critical_reports(bpy.types.Operator):
 # ==================================================
 # Toggle / handler callbacks
 # ==================================================
+# Suppresses _on_use_project_prefs_toggle while hot_reload_tools
+# restores the UI snapshot. Without this, restoring a saved
+# use_project_prefs=True would immediately re-import the .blend's
+# stored prefs, only for tool_snapshot to overwrite them one step
+# later. The checkbox state is restored; the actual apply is left
+# to the next .blend load or an explicit user toggle.
+_suppress_project_prefs_apply = 0
+
+
 def _on_use_project_prefs_toggle(self, context):
     """Apply the loaded .blend's stored prefs when the user opts in.
 
@@ -996,6 +1008,8 @@ def _on_use_project_prefs_toggle(self, context):
     current state. It only means the next .blend load will skip the
     project-prefs branch and fall back to the session state.
     """
+    if _suppress_project_prefs_apply > 0:
+        return
     if not self.use_project_prefs:
         return
     data, present = prefs_io.get_project_data()
@@ -1821,11 +1835,24 @@ def hot_reload_tools():
         new_prefs = addon.preferences
 
         # 8a. Restore UI state onto the fresh instance.
-        for attr, value in ui_snapshot.items():
-            try:
-                setattr(new_prefs, attr, value)
-            except Exception:
-                pass
+        #
+        # use_project_prefs carries an update callback that would
+        # re-import the .blend's stored prefs here. That apply is
+        # wrong during hot reload: the very next steps re-init the
+        # toggles and overlay tool_snapshot, so the project prefs
+        # would be applied and then immediately overwritten. Suppress
+        # the callback so only the checkbox state is restored; the
+        # actual apply waits for the next .blend load.
+        global _suppress_project_prefs_apply
+        _suppress_project_prefs_apply += 1
+        try:
+            for attr, value in ui_snapshot.items():
+                try:
+                    setattr(new_prefs, attr, value)
+                except Exception:
+                    pass
+        finally:
+            _suppress_project_prefs_apply -= 1
 
         # 8b. Rebuild panels under the restored category.
         try:

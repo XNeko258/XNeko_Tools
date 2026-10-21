@@ -1,7 +1,6 @@
 import bpy
 import pkgutil
 import importlib
-import importlib.util
 import sys
 import gc
 import os
@@ -311,6 +310,20 @@ def get_short_id(full_id):
 def discover_tools(package_name, package_path):
     _state.registration_issues.clear()
     new_registry = {}
+
+    if not package_path:
+        _state.registration_issues.append({
+            "type": "import_failed",
+            "tool_id": "",
+            "paths": [package_name],
+            "error": "package __path__ is empty; no tools discovered",
+        })
+        _report_issue(
+            f"[XNeko] package __path__ is empty for {package_name}; "
+            f"skipping discovery"
+        )
+        _TOOL_REGISTRY.clear()
+        return
 
     prefix = f"{package_name}."
     for info in pkgutil.walk_packages(package_path, prefix=prefix):
@@ -799,8 +812,22 @@ def build_group_registry(groups, registered_groups):
 # ============================================================
 def _initialize_tools():
     package_name = __package__
-    package_path = sys.modules[package_name].__path__
+    module = sys.modules.get(package_name) if package_name else None
+    if module is None:
+        _state.registered_groups.clear()
+        _state.registration_issues.append({
+            "type": "import_failed",
+            "tool_id": "",
+            "paths": [str(package_name)],
+            "error": "addon package not in sys.modules",
+        })
+        _report_issue(
+            f"[XNeko] {package_name} not found in sys.modules; "
+            f"skipping discovery"
+        )
+        return list(_state.registration_issues)
 
+    package_path = module.__path__
     _state.reset_registration()
     discover_tools(package_name, package_path)
     issues = collect_registration_issues()
@@ -880,6 +907,8 @@ def register_group_panels(category="XNeko Tools"):
             bpy.utils.register_class(cls)
         except Exception as e:
             print(f"[XNeko] group panel {gid} failed: {e}")
+            _GROUP_PANELS.pop(gid, None)
+            _GROUP_PANEL_CLASSES.pop()
             _reports.report_tool_error(
                 "group panel registration failed",
                 exc=e,
@@ -1040,6 +1069,11 @@ def load_tool(tool_id):
             except Exception as e:
                 print(f"[XNeko] register PropertyGroup "
                       f"{cls.__name__} failed: {e}")
+                _reports.report_tool_error(
+                    f"PropertyGroup register failed: {cls.__name__}",
+                    exc=e,
+                    extra={"tool_id": tool_id},
+                )
 
     # Non-PropertyGroup classes
     for cls in tool["classes"]:

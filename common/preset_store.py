@@ -119,8 +119,13 @@ def save_preset(name, data):
 def delete_preset(name):
     # Delete from wherever it actually lives (user or legacy).
     path = _find_preset_path(name)
-    if path is not None:
+    if path is None:
+        return
+    try:
         os.remove(path)
+    except OSError as e:
+        print(f"[XNeko] failed to delete preset '{name}': {e}")
+        raise
 
 
 # ============================================================
@@ -153,8 +158,8 @@ def sanitize_name(name):
         cleaned = "_" + cleaned
     # Reserve the "__" prefix so preset names can never collide with
     # internal sentinels such as preferences.NONE_PRESET_ID.
-    while cleaned.startswith("__"):
-        cleaned = "_" + cleaned
+    if cleaned.startswith("__"):
+        cleaned = "_" + cleaned.lstrip("_")
     if len(cleaned) > 120:
         cleaned = cleaned[:120].rstrip()
     return cleaned
