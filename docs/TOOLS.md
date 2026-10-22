@@ -134,17 +134,13 @@ this tool batch-edits them by a fixed angle around a common pivot.
   once a rig has more than a handful of groups.
 
 
-## Driver Cleaner
+## Anim Data Cleaner
 
-- **tool_id:** `driver_cleaner`
+- **tool_id:** `anim_data_cleaner`
 
-- **What it does:** Lists invalid and duplicate drivers on selected objects only — object itself, 
-  its data, shape keys / key blocks, bones, pose bones, and materials. 
-  Each problem item can be checked individually, or cleaned by category with **Clean All Invalid** / **Clean All Dup**. 
-  Duplicate detection uses `(data_path, array_index, expression)` as the signature and keeps the first driver.
+- **What it does:** Lists every problem in the animation data of selected objects — the object itself, its data, shape keys, pose bones, and materials. Three categories are reported: invalid and duplicate **drivers**, empty or broken **actions** (invalid / duplicate f-curves), and empty **NLA tracks / strips**. Each category can be cleaned on its own with one button, or all at once. A Refresh button re-scans when data was changed outside the tool.
 
-- **Why it exists:** Edited armatures often carry dead and duplicated drivers that cause heavy viewport lag. 
-  This tool finds and clears them on the selection in one click, without touching unrelated data.
+- **Why it exists:** Long-running rigs and files accumulate dead drivers, duplicated f-curves, empty actions, and stale NLA tracks that cause heavy viewport lag. This tool finds and clears all of them on the selection in one click, without touching unrelated data.
 
 
 ## Quick Eye Bone
