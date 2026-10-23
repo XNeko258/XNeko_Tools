@@ -158,6 +158,16 @@ this tool batch-edits them by a fixed angle around a common pivot.
 
 To eliminate tedious manual eye rigging. Inspired by the **Auto-Rig Pro (ARP) Smart** marker system, it turns a multi-step setup into a single, fluid click.
 
+## Node Group Clean
+
+- **tool_id:** `node_group_clean`
+
+**What it does:**
+Scans node groups within the selected object's materials and cross-references them against the entire file using structural topology and parameter hashing to find duplicates. It allows manual or automatic replacement of duplicate groups while preserving input values, and safely clears isolated (unconnected) nodes. To prevent accidental data loss, it only breaks references and turns old data into orphans instead of hard-deleting them. It also features a global search to find and copy the names of materials referencing a specific node group.
+
+**Why it exists:**
+Importing assets from different projects often generates structurally identical but redundant node groups (e.g., `.001` copies), bloating the file. This tool provides a fast way to screen, safely replace, and merge these duplicates, while cleaning up dangling nodes and keeping the underlying data safe for manual purging.
+
 ---
 
 <!-- New tool template:
