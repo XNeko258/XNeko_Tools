@@ -811,6 +811,7 @@ def build_group_registry(groups, registered_groups):
 # Initialization / rescan
 # ============================================================
 def _initialize_tools():
+    _reported_child_attr_issues.clear()
     package_name = __package__
     module = sys.modules.get(package_name) if package_name else None
     if module is None:
@@ -927,6 +928,75 @@ def unregister_group_panels():
     _GROUP_LOADED_COUNT.clear()
 
 
+# Tracks (tool_id, class_name, attr_name) tuples that already produced
+# a child-panel mismatch report, so repeated attach passes (tool
+# enable/disable) do not spam logs with the same warning. Cleared in
+# _initialize_tools() so a hot reload reports current issues again.
+_reported_child_attr_issues = set()
+
+
+def _iter_tool_panels(tool):
+    """Yield (cls, bl_idname) for every Panel class in a tool."""
+    for cls in tool.get("classes", ()):
+        if isinstance(cls, type) and issubclass(cls, bpy.types.Panel):
+            yield cls, getattr(cls, "bl_idname", None)
+
+
+def _collect_tool_panel_ids(tool):
+    """Return the set of bl_idname values defined by this tool's Panels."""
+    return {bid for _cls, bid in _iter_tool_panels(tool) if bid}
+
+
+def _has_own_bl_attr(cls, attr_name):
+    """True if attr_name is defined on cls or a non-Blender base.
+
+    Checks the MRO up to (but not including) bpy.types.Panel, so an
+    inherited or mixin-supplied bl_category counts as "explicit".
+    """
+    for klass in cls.__mro__:
+        if klass is bpy.types.Panel:
+            return False
+        if attr_name in klass.__dict__:
+            return True
+    return False
+
+
+def _sync_child_category(cls, parent_cls):
+    """Align a child panel's bl_category to its parent when unset.
+
+    Blender requires bl_category to match between a panel and its
+    parent, otherwise the child is silently dropped. Only fills in
+    the value when the author has not supplied one, so explicit
+    choices survive.
+    """
+    if _has_own_bl_attr(cls, "bl_category"):
+        return
+    cls.bl_category = getattr(parent_cls, "bl_category", "XNeko Tools")
+
+
+def _check_child_attrs(cls, parent_cls, tool_id):
+    """Report (do not modify) mismatched space/region on a child."""
+    for attr in ("bl_space_type", "bl_region_type"):
+        child_val = getattr(cls, attr, None)
+        parent_val = getattr(parent_cls, attr, None)
+        if child_val is not None and parent_val is not None \
+                and child_val != parent_val:
+            key = (tool_id, cls.__name__, attr)
+            if key in _reported_child_attr_issues:
+                continue
+            _reported_child_attr_issues.add(key)
+            _reports.report_tool_error(
+                f"child panel {attr} mismatch",
+                extra={
+                    "tool_id": tool_id,
+                    "cls": cls.__name__,
+                    "child": child_val,
+                    "parent": parent_val,
+                    "effect": "child panel may not display",
+                },
+            )
+
+
 def attach_panels_to_groups(tool=None):
     tools = _TOOL_REGISTRY.values() if tool is None else (tool,)
 
@@ -937,26 +1007,65 @@ def attach_panels_to_groups(tool=None):
             continue
 
         parent_id = parent_cls.bl_idname
+        tool_id = t.get("tool_id", "?")
+
+        # Built once per tool; O(n) getattr calls.
+        tool_panel_ids = _collect_tool_panel_ids(t)
+        panel_by_id = {
+            bid: cls for cls, bid in _iter_tool_panels(t) if bid
+        }
+
         for cls in t["classes"]:
-            # Isolate per-class attachment. A malformed Panel (e.g. a
-            # class whose bl_options is None, or a custom __setattr__
-            # that rejects bl_parent_id) would otherwise raise here,
-            # propagate up through load_tool -> _on_toggle, and freeze
-            # the addon-preference checkbox for this tool.
             try:
                 if not isinstance(cls, type) or not issubclass(cls, bpy.types.Panel):
                     continue
 
+                existing_parent = getattr(cls, "bl_parent_id", "") or ""
+
+                # --- 1. Tool-internal child: hand over control ---
+                if existing_parent and existing_parent in tool_panel_ids:
+                    parent_panel = panel_by_id.get(existing_parent)
+                    if parent_panel is not None:
+                        _sync_child_category(cls, parent_panel)
+                        _check_child_attrs(cls, parent_panel, tool_id)
+                    # bl_parent_id and bl_options are left untouched.
+                    continue
+
+                # --- 2. Unresolved bl_parent_id: report and fall back ---
+                #
+                # Covers both typos (the class does not exist) and
+                # cross-addon parents (the parent lives outside this
+                # tool). Both are treated the same way: the panel is
+                # re-parented to the group so it is still reachable,
+                # and the issue is reported so the author can fix it.
+                if existing_parent:
+                    _reports.report_tool_error(
+                        "panel bl_parent_id does not resolve",
+                        extra={
+                            "tool_id": tool_id,
+                            "cls": cls.__name__,
+                            "bl_parent_id": existing_parent,
+                            "effect": "falling back to group panel",
+                        },
+                    )
+
+                # --- 3. Tool top-level panel: framework takes over ---
                 cls.bl_parent_id = parent_id
+
+                if not _has_own_bl_attr(cls, "bl_category"):
+                    cls.bl_category = getattr(
+                        parent_cls, "bl_category", "XNeko Tools"
+                    )
 
                 existing = set(getattr(cls, "bl_options", None) or set())
                 if 'DEFAULT_CLOSED' not in existing:
                     cls.bl_options = existing | {'DEFAULT_CLOSED'}
+
             except Exception as e:
                 cls_name = getattr(cls, "__name__", repr(cls))
                 print(
                     f"[XNeko] attach panel {cls_name} in "
-                    f"{t.get('tool_id', '?')} failed: {e}"
+                    f"{tool_id} failed: {e}"
                 )
 
                 mod = t.get("module")
@@ -971,7 +1080,7 @@ def attach_panels_to_groups(tool=None):
                     "panel attach to group failed",
                     exc=e,
                     extra={
-                        "tool_id": t.get("tool_id", "?"),
+                        "tool_id": tool_id,
                         "cls": cls_name,
                         "file": mod_file,
                         "field": f"class {cls_name}",

@@ -1974,11 +1974,20 @@ def refresh_panel_category(force=False):
     _last_category = new_category
 
     all_panels = list(core._GROUP_PANEL_CLASSES)
+
     for tool in core._TOOL_REGISTRY.values():
-        if tool["loaded"]:
-            for cls in tool["classes"]:
-                if isinstance(cls, type) and issubclass(cls, bpy.types.Panel):
-                    all_panels.append(cls)
+        if not tool["loaded"]:
+            continue
+
+        for cls in tool["classes"]:
+            if not (isinstance(cls, type)
+                    and issubclass(cls, bpy.types.Panel)):
+                continue
+
+            # Every tool panel follows the global category. Child
+            # panels must match their parent or Blender drops them,
+            # so per-panel bl_category is not honored here.
+            all_panels.append(cls)
 
     if not all_panels:
         return
